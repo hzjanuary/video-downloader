@@ -9,3 +9,13 @@ dist/
 
 # Downloaded Harness CLI binary for installed project instances.
 scripts/bin/harness-cli
+
+# Frontend dependencies and build output.
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env*.local
+frontend/*.tsbuildinfo
+
+# Local logs.
+*.log

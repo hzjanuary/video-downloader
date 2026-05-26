@@ -1,211 +1,208 @@
-# harness-experimental
+# Video Downloader
 
-Turn any software repo into an agent-ready workspace.
+Full-stack video downloader workspace with a Next.js frontend and a Rust Axum
+backend. The app accepts YouTube channel/playlist URLs and TikTok profile URLs,
+lists videos, lets the user select one or many items, and streams a ZIP archive
+back to the browser.
 
-`harness-experimental` is a repository-level operating harness for Claude Code,
-Codex, Cursor, and other coding agents. It gives agents the missing project
-context they need before they change code: where to start, what the product
-contract says, how risky the work is, what proof is required, and which
-decisions future agents should inherit.
+This repository also includes Harness documentation and story tracking under
+`docs/` and `scripts/harness`.
 
-The app is what users touch. The harness is what agents touch.
+## Current Features
 
-## Why Star This Repo
+- Next.js App Router frontend in `frontend`.
+- Rust Axum backend in `backend`.
+- Health check: `GET /api/health`.
+- Single video extraction: `GET /api/extract?url={link}`.
+- Channel/profile listing: `GET /api/channel?url={link}`.
+- Bulk download: `POST /api/download/bulk`.
+- YouTube channel/user/handle/playlist pagination through continuation tokens.
+- TikTok profile pagination through cursor/max_cursor.
+- Streaming ZIP response with concurrent Tokio download tasks.
 
-Star this repo if you want practical, reusable patterns for making AI-assisted
-software development more reliable, inspectable, and easier for humans to steer.
+## Tech Stack
 
-This project is exploring a simple idea:
+| Surface | Stack |
+| --- | --- |
+| Frontend | Next.js, React, TypeScript |
+| Backend | Rust, Axum, Tokio |
+| HTTP client | `reqwest` |
+| Parsing | `regex`, `serde_json` |
+| Validation | Cargo tests, Next build/typecheck, Harness matrix |
 
-> Coding agents do not only need better prompts. They need better repositories.
-
-## The Problem
-
-Most repos are built for humans reading code in a familiar codebase. Coding
-agents usually enter with only a chat prompt and a shallow snapshot of files.
-That leads to common failure modes:
-
-- The agent edits code before understanding product intent.
-- Important constraints live only in chat history or in someone's head.
-- Validation expectations are vague or discovered too late.
-- Architecture tradeoffs are repeated instead of inherited.
-- Large requests do not get broken into reviewable story-sized work.
-
-## The Harness Approach
-
-A repository starts to have a harness when it helps an agent answer practical
-engineering questions without relying only on chat history:
-
-- What should I read first?
-- What type of work is this?
-- Which product contract does it affect?
-- How risky is the change?
-- What proof will show the work is done?
-- What decision or lesson should future agents inherit?
-
-In this repo, those answers live in:
-
-- `AGENTS.md` — the stable agent shim with local project notes and Harness
-  doc links.
-- `docs/HARNESS.md` — the human-agent collaboration model.
-- `docs/FEATURE_INTAKE.md` — tiny, normal, and high-risk work classification.
-- `docs/ARCHITECTURE.md` — architecture discovery and boundary rules.
-- `docs/TEST_MATRIX.md` — behavior-to-proof validation expectations.
-- `docs/stories/` — story packets and backlog items.
-- `docs/decisions/` — durable decisions and tradeoffs.
-- `docs/templates/` — reusable spec, story, decision, and validation templates.
-
-OpenAI describes this shift as an agent-first world where humans steer and
-agents execute:
-
-https://openai.com/index/harness-engineering/
-
-## Install Harness Into A Project
-
-From a target project directory, run:
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/hoangnb24/harness-experimental/main/scripts/install-harness.sh?$(date +%s)" | bash -s -- --yes
-```
-
-If the target already has `AGENTS.md`, `docs/`, or `scripts/`, choose one:
-
-```bash
-# Update an existing Harness repo without moving existing files
-curl -fsSL "https://raw.githubusercontent.com/hoangnb24/harness-experimental/main/scripts/install-harness.sh?$(date +%s)" | bash -s -- --merge --yes
-
-# Back up and replace AGENTS.md, docs/, and scripts/
-curl -fsSL "https://raw.githubusercontent.com/hoangnb24/harness-experimental/main/scripts/install-harness.sh?$(date +%s)" | bash -s -- --override --yes
-```
-
-Use `--merge` when a project already has Harness and you want to append newly
-added Harness files without moving the existing `AGENTS.md`, `docs/`, or
-`scripts/` paths into backup. Existing files stay untouched; only missing
-Harness files are created.
-
-For older Harness installs whose `AGENTS.md` still contains the full generated
-operating guide, refresh it into the small stable shim:
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/hoangnb24/harness-experimental/main/scripts/install-harness.sh?$(date +%s)" | bash -s -- --merge --refresh-agent-shim --yes
-```
-
-The refresh backs up the existing file. If it detects the old
-Harness-generated guide, it replaces it with the shim. If the file appears
-custom, it appends or updates a marked Harness block instead of overwriting the
-project's local instructions.
-
-Or install into a specific path:
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/hoangnb24/harness-experimental/main/scripts/install-harness.sh?$(date +%s)" | bash -s -- --directory /path/to/project --yes
-```
-
-Use `--dry-run` to preview changes before writing files.
-
-The installer also downloads the prebuilt Harness CLI for the current platform,
-verifies its `.sha256` checksum, and installs it at
-`scripts/bin/harness-cli`. The Rust CLI is the main Harness tool. Installed
-projects keep `scripts/harness` as the stable command path, and that entrypoint
-uses the Rust binary for normal Harness work.
-
-Harness CLI release assets are published from tags by the
-`Harness CLI Release` GitHub Actions workflow. The installer expects each
-release to include `harness-cli-<platform>` and
-`harness-cli-<platform>.sha256` assets for macOS arm64, macOS x64, Linux x64,
-and Linux arm64.
-
-## Try The Flow
-
-The fastest way to understand the harness is to inspect the tiny demo:
-
-- `docs/demo/README.md`: shows how a simple product idea becomes product docs,
-  stories, validation expectations, and decisions before implementation starts.
-
-A typical flow looks like this:
+## Repository Layout
 
 ```text
-human intent or product spec
-  -> product contract
-  -> feature intake
-  -> story packet
-  -> validation expectations
-  -> implementation work
-  -> decision or lesson captured for future agents
+frontend/
+  app/                  Next.js bulk download UI
+
+backend/
+  src/
+    bulk.rs             ZIP streaming bulk download worker
+    channel/            YouTube/TikTok channel and profile crawlers
+    extract/            Single-video extraction parsers
+    main.rs             Axum routes and app wiring
+    model.rs            Shared response models
+
+docs/
+  product/              Product contracts
+  stories/              Story packets and validation evidence
+  HARNESS.md            Harness operating guide
+
+scripts/
+  harness               Stable Harness CLI entrypoint
 ```
 
-Implementation prompts do not go straight to code. They first pass through
-feature intake, become story-sized work when needed, and then carry both product
-validation and harness maintenance expectations.
+## Requirements
 
-## Current State
+- Node.js and npm.
+- Rust toolchain with Cargo.
+- The Harness CLI already installed at `scripts/bin/harness-cli`.
 
-This repository is in Harness v0.
+## Run Locally
 
-There is no application implementation and no baked-in product specification
-yet. The current work is the reusable project harness: the file structure,
-agent operating model, feature intake process, story templates, and validation
-expectations that help humans and agents turn a future user-provided spec into
-implementation work.
+Install frontend dependencies:
 
-## Product Sources
+```bash
+cd frontend
+npm install
+```
 
-No product contract is currently defined.
+Start the backend:
 
-When a user provides a project specification, add or reference it as the input
-spec for the first buildout, then derive smaller living artifacts from it:
+```bash
+cd backend
+cargo run
+```
 
-- `docs/product/`: current product contract files, created from the spec.
-- `docs/stories/`: story packets and backlog created from selected work.
-- `docs/TEST_MATRIX.md`: behavior-to-proof control panel.
-- `docs/decisions/`: durable decisions and tradeoffs.
+Start the frontend in another terminal:
 
-Do not keep a project-specific spec or product breakdown in this harness until
-a real project supplies one.
+```bash
+cd frontend
+npm run dev
+```
 
-## Repository Structure
+Open:
 
 ```text
-project/
-  AGENTS.md
-  README.md
-  docs/
-    HARNESS.md
-    FEATURE_INTAKE.md
-    ARCHITECTURE.md
-    TEST_MATRIX.md
-    HARNESS_BACKLOG.md
-    product/
-    stories/
-    decisions/
-    demo/
-    templates/
-  scripts/
-    README.md
+http://localhost:3000
 ```
 
-## Contributing
+The backend listens on:
 
-This project is early and benefits most from real-world agent failure cases,
-example harness installs, docs improvements, and reusable workflow patterns.
-See `CONTRIBUTING.md` for contribution ideas.
+```text
+http://localhost:8080
+```
 
-Useful contributions include:
+The frontend reads `NEXT_PUBLIC_API_BASE_URL` and defaults to
+`http://localhost:8080`.
 
-- Show how the harness works in a real project.
-- Add missing templates or improve existing ones.
-- Propose validation patterns for different stacks.
-- Share failures where an agent made the wrong change because the repo lacked
-  context.
-- Compare harness behavior across Claude Code, Codex, Cursor, and other tools.
+## API
 
-## Share
+### `GET /api/health`
 
-If this idea resonates, please star the repo and share it with someone building
-with coding agents.
+Returns plain text:
 
-Short description:
+```text
+OK: backend is healthy
+```
 
-> An agent-ready repo harness for Claude Code, Codex, Cursor, and other coding
-> agents: AGENTS.md, product contracts, story packets, validation matrix, and
-> decision records.
+### `GET /api/extract?url={link}`
+
+Fetches a single YouTube or TikTok video page and returns normalized metadata:
+
+```json
+{
+  "platform": "youtube",
+  "source_url": "https://www.youtube.com/watch?v=abc123",
+  "id": "abc123",
+  "title": "Example video",
+  "author": "Example channel",
+  "duration_seconds": 61,
+  "thumbnail_url": "https://example.com/thumb.jpg",
+  "streams": []
+}
+```
+
+### `GET /api/channel?url={link}`
+
+Returns a list of short video metadata:
+
+```json
+[
+  {
+    "id": "video-id",
+    "title": "Video title",
+    "thumbnail_url": "https://example.com/thumb.jpg"
+  }
+]
+```
+
+Supported inputs:
+
+- YouTube `/channel/...`
+- YouTube `/c/...`
+- YouTube `/user/...`
+- YouTube `/@handle/...`
+- YouTube `/playlist?list=...`
+- TikTok `/@username`
+
+### `POST /api/download/bulk`
+
+Request:
+
+```json
+{
+  "source_url": "https://www.youtube.com/@channel/videos",
+  "ids": ["video-id-1", "video-id-2"]
+}
+```
+
+Response:
+
+- `200 application/zip`
+- `Content-Disposition: attachment; filename="videos.zip"`
+- streamed ZIP body
+
+The backend starts download tasks concurrently and streams ZIP bytes through the
+HTTP response instead of writing temporary files or buffering the full archive.
+
+## Frontend Workflow
+
+1. Paste a YouTube channel/playlist or TikTok profile URL.
+2. Click `Fetch`.
+3. Select individual videos or use `Chọn tất cả`.
+4. Click `Tải xuống x video`.
+5. Save the returned ZIP file.
+
+## Validation
+
+Backend:
+
+```bash
+cd backend
+cargo fmt --check
+cargo check --offline
+cargo test --offline
+```
+
+Frontend:
+
+```bash
+cd frontend
+npm run typecheck
+npm run build
+```
+
+Harness matrix:
+
+```bash
+scripts/harness query matrix
+```
+
+## Notes
+
+- Provider HTML and pagination APIs are volatile. Tests use deterministic
+  fixtures for YouTube and TikTok parsing/pagination behavior.
+- The bulk ZIP writer currently targets normal ZIP archives, not Zip64.
+- This project intentionally does not use `yt-dlp` or provider wrapper modules.
