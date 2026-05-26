@@ -43,11 +43,13 @@ impl AppState {
 #[derive(Debug, Deserialize)]
 struct ExtractQuery {
     url: String,
+    cookie: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChannelQuery {
     url: String,
+    cookie: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,7 +144,10 @@ async fn extract(
     State(state): State<AppState>,
     Query(query): Query<ExtractQuery>,
 ) -> Result<Json<model::VideoInfo>, ApiError> {
-    let info = state.extractor.extract(&query.url).await?;
+    let info = state
+        .extractor
+        .extract_with_cookie(&query.url, query.cookie.as_deref())
+        .await?;
 
     Ok(Json(info))
 }
@@ -151,7 +156,10 @@ async fn channel(
     State(state): State<AppState>,
     Query(query): Query<ChannelQuery>,
 ) -> Result<Json<Vec<model::ChannelVideo>>, ApiError> {
-    let videos = state.channel_fetcher.fetch_channel(&query.url).await?;
+    let videos = state
+        .channel_fetcher
+        .fetch_channel_with_cookie(&query.url, query.cookie.as_deref())
+        .await?;
 
     Ok(Json(videos))
 }
@@ -281,6 +289,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extract_route_returns_normalized_facebook_metadata() {
+        let source_url = "https://www.facebook.com/reel/123456789012345";
+        let response = test_app_with_fixture(source_url, facebook_fixture())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/extract?url=https%3A%2F%2Fwww.facebook.com%2Freel%2F123456789012345&cookie=c_user%3Dfixture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["platform"], "facebook");
+        assert_eq!(json["id"], "123456789012345");
+        assert_eq!(json["title"], "Fixture Facebook Reel");
+        assert_eq!(
+            json["streams"][0]["url"],
+            "https://video.xx.fbcdn.net/v/fixture-hd.mp4?token=abc&bytestart=0"
+        );
+    }
+
+    #[tokio::test]
     async fn extract_route_rejects_unsupported_hosts() {
         let response = test_app()
             .oneshot(
@@ -390,6 +425,20 @@ mod tests {
         "#
     }
 
+    fn facebook_fixture() -> &'static str {
+        r#"
+            <html>
+              <head>
+                <meta property="og:title" content="Fixture Facebook Reel" />
+                <meta property="og:image" content="https://img.example/fb.jpg" />
+              </head>
+              <script>
+                {"playable_url_quality_hd": "https:\/\/video.xx.fbcdn.net\/v\/fixture-hd.mp4?token=abc\u0026bytestart=0"}
+              </script>
+            </html>
+        "#
+    }
+
     #[tokio::test]
     async fn channel_route_returns_all_youtube_fixture_videos() {
         let response = test_app_with_channel_fixtures([
@@ -460,6 +509,37 @@ mod tests {
         assert_eq!(json[0]["id"], "tt001");
         assert_eq!(json[4]["id"], "tt005");
         assert_eq!(json[4]["thumbnail_url"], "https://tt/5.jpg");
+    }
+
+    #[tokio::test]
+    async fn channel_route_returns_all_facebook_fixture_videos() {
+        let response = test_app_with_channel_fixtures([
+            (
+                "https://www.facebook.com/fixture/videos".to_string(),
+                channel::tests::facebook_initial_html().to_string(),
+            ),
+            (
+                "facebook:cursor:FB_CURSOR_1".to_string(),
+                channel::tests::facebook_cursor_one().to_string(),
+            ),
+        ])
+        .oneshot(
+            Request::builder()
+                .uri("/api/channel?url=https%3A%2F%2Fwww.facebook.com%2Ffixture%2Fvideos&cookie=c_user%3Dfixture")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json.as_array().unwrap().len(), 3);
+        assert_eq!(json[0]["id"], "111111111111111");
+        assert_eq!(json[2]["id"], "333333333333333");
     }
 
     #[tokio::test]

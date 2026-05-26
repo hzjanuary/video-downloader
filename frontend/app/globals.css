@@ -31,7 +31,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -100,14 +101,29 @@ h1 {
 }
 
 input[type="text"],
-.input-row input {
+.input-row input,
+textarea {
   width: 100%;
-  min-height: 44px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #ffffff;
   color: var(--text);
   padding: 0 12px;
+}
+
+.input-row input {
+  min-height: 44px;
+}
+
+textarea {
+  min-height: 72px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  resize: vertical;
+}
+
+.input-row + label {
+  margin-top: 14px;
 }
 
 button {

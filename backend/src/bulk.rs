@@ -23,6 +23,7 @@ const DOWNLOAD_CHANNEL_BUFFER: usize = 4;
 #[derive(Debug, Deserialize)]
 pub struct BulkDownloadRequest {
     pub source_url: Option<String>,
+    pub cookie: Option<String>,
     pub ids: Vec<String>,
 }
 
@@ -88,7 +89,7 @@ impl BulkDownloader {
     pub fn live(extractor: Arc<Extractor>) -> Result<Self, reqwest::Error> {
         Ok(Self {
             client: Client::builder()
-                .user_agent("Mozilla/5.0 (compatible; VideoDownloader/0.1; +http://localhost:3000)")
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
                 .build()?,
             extractor,
             source: DownloadSource::Live,
@@ -118,7 +119,7 @@ impl BulkDownloader {
             return Err(BulkDownloadError::TooManyIds);
         }
 
-        let entries = self.start_downloads(ids, request.source_url);
+        let entries = self.start_downloads(ids, request.source_url, request.cookie);
         let (sender, receiver) = mpsc::channel(OUTPUT_CHANNEL_BUFFER);
 
         tokio::spawn(async move {
@@ -130,7 +131,12 @@ impl BulkDownloader {
         Ok(ReceiverStream { receiver })
     }
 
-    fn start_downloads(&self, ids: Vec<String>, source_url: Option<String>) -> Vec<DownloadEntry> {
+    fn start_downloads(
+        &self,
+        ids: Vec<String>,
+        source_url: Option<String>,
+        cookie: Option<String>,
+    ) -> Vec<DownloadEntry> {
         ids.into_iter()
             .map(|id| {
                 let (sender, receiver) = mpsc::channel(DOWNLOAD_CHANNEL_BUFFER);
@@ -141,11 +147,19 @@ impl BulkDownloader {
                         let client = self.client.clone();
                         let extractor = self.extractor.clone();
                         let source_url = source_url.clone();
+                        let cookie = cookie.clone();
                         let download_id = id.clone();
 
                         tokio::spawn(async move {
-                            download_live_id(client, extractor, source_url, download_id, sender)
-                                .await;
+                            download_live_id(
+                                client,
+                                extractor,
+                                source_url,
+                                cookie,
+                                download_id,
+                                sender,
+                            )
+                            .await;
                         });
                     }
                     #[cfg(test)]
@@ -190,16 +204,20 @@ async fn download_live_id(
     client: Client,
     extractor: Arc<Extractor>,
     source_url: Option<String>,
+    cookie: Option<String>,
     id: String,
     sender: mpsc::Sender<Result<Bytes, String>>,
 ) {
     let result = async {
-        let download_url = resolve_download_url(extractor, source_url.as_deref(), &id).await?;
-        let response = client
-            .get(&download_url)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+        let download_url =
+            resolve_download_url(extractor, source_url.as_deref(), cookie.as_deref(), &id).await?;
+        let mut request = client.get(&download_url);
+
+        if let Some(cookie) = clean_cookie(cookie.as_deref()) {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+
+        let response = request.send().await.map_err(|error| error.to_string())?;
 
         if !response.status().is_success() {
             return Err(format!("download source returned {}", response.status()));
@@ -227,6 +245,7 @@ async fn download_live_id(
 async fn resolve_download_url(
     extractor: Arc<Extractor>,
     source_url: Option<&str>,
+    cookie: Option<&str>,
     id: &str,
 ) -> Result<String, String> {
     if id.starts_with("http://") || id.starts_with("https://") {
@@ -241,12 +260,14 @@ async fn resolve_download_url(
         let username = tiktok_username(source_url)
             .ok_or_else(|| "TikTok source_url must contain @username".to_string())?;
         format!("https://www.tiktok.com/{username}/video/{id}")
+    } else if is_facebook_url(source_url) {
+        format!("https://www.facebook.com/watch/?v={id}")
     } else {
-        return Err("source_url must be YouTube or TikTok".to_string());
+        return Err("source_url must be YouTube, TikTok, or Facebook".to_string());
     };
 
     let info = extractor
-        .extract(&video_url)
+        .extract_with_cookie(&video_url, cookie)
         .await
         .map_err(|error| error.message())?;
     let stream = info
@@ -480,6 +501,15 @@ fn is_tiktok_url(source_url: &str) -> bool {
         .is_some_and(|host| host == "tiktok.com" || host.ends_with(".tiktok.com"))
 }
 
+fn is_facebook_url(source_url: &str) -> bool {
+    host_from_url(source_url).is_some_and(|host| {
+        host == "facebook.com"
+            || host.ends_with(".facebook.com")
+            || host == "fb.watch"
+            || host.ends_with(".fb.watch")
+    })
+}
+
 fn host_from_url(source_url: &str) -> Option<String> {
     let without_scheme = source_url
         .strip_prefix("https://")
@@ -501,6 +531,10 @@ fn tiktok_username(source_url: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn clean_cookie(cookie: Option<&str>) -> Option<&str> {
+    cookie.map(str::trim).filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -514,6 +548,7 @@ pub(crate) mod tests {
         let stream = downloader
             .download_zip(BulkDownloadRequest {
                 source_url: None,
+                cookie: None,
                 ids: vec!["alpha".to_string(), "beta".to_string()],
             })
             .unwrap();

@@ -1,3 +1,4 @@
+mod facebook;
 mod tiktok;
 mod youtube;
 
@@ -8,6 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use reqwest::Client;
 
+pub use facebook::parse_facebook;
 pub use tiktok::parse_tiktok;
 pub use youtube::parse_youtube;
 
@@ -26,7 +28,9 @@ pub enum ExtractError {
 impl ExtractError {
     pub fn message(&self) -> String {
         match self {
-            Self::UnsupportedUrl => "unsupported url; expected YouTube or TikTok".to_string(),
+            Self::UnsupportedUrl => {
+                "unsupported url; expected YouTube, TikTok, or Facebook".to_string()
+            }
             Self::FetchFailed(error) => format!("failed to fetch source html: {error}"),
             Self::MissingJson(name) => format!("could not find {name} json in html"),
             Self::InvalidJson(error) => format!("invalid provider json: {error}"),
@@ -40,6 +44,7 @@ impl ExtractError {
 enum Provider {
     YouTube,
     TikTok,
+    Facebook,
 }
 
 #[derive(Clone)]
@@ -59,7 +64,7 @@ impl Extractor {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))
-            .user_agent("Mozilla/5.0 (compatible; VideoDownloader/0.1; +http://localhost:3000)")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
             .build()?;
 
         Ok(Self {
@@ -74,21 +79,40 @@ impl Extractor {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn extract(&self, source_url: &str) -> Result<VideoInfo, ExtractError> {
+        self.extract_with_cookie(source_url, None).await
+    }
+
+    pub async fn extract_with_cookie(
+        &self,
+        source_url: &str,
+        cookie: Option<&str>,
+    ) -> Result<VideoInfo, ExtractError> {
         let provider = provider_for_url(source_url).ok_or(ExtractError::UnsupportedUrl)?;
-        let html = self.fetch_html(source_url).await?;
+        let html = self.fetch_html(source_url, cookie).await?;
 
         match provider {
             Provider::YouTube => parse_youtube(source_url, &html),
             Provider::TikTok => parse_tiktok(source_url, &html),
+            Provider::Facebook => parse_facebook(source_url, &html),
         }
     }
 
-    async fn fetch_html(&self, source_url: &str) -> Result<String, ExtractError> {
+    async fn fetch_html(
+        &self,
+        source_url: &str,
+        cookie: Option<&str>,
+    ) -> Result<String, ExtractError> {
         match &self.fetcher {
             HtmlFetcher::Live(client) => {
-                let response = client
-                    .get(source_url)
+                let mut request = client.get(source_url);
+
+                if let Some(cookie) = clean_cookie(cookie) {
+                    request = request.header(reqwest::header::COOKIE, cookie);
+                }
+
+                let response = request
                     .send()
                     .await
                     .map_err(|error| ExtractError::FetchFailed(error.to_string()))?;
@@ -123,6 +147,14 @@ fn provider_for_url(source_url: &str) -> Option<Provider> {
 
     if host == "tiktok.com" || host.ends_with(".tiktok.com") {
         return Some(Provider::TikTok);
+    }
+
+    if host == "facebook.com"
+        || host.ends_with(".facebook.com")
+        || host == "fb.watch"
+        || host.ends_with(".fb.watch")
+    {
+        return Some(Provider::Facebook);
     }
 
     None
@@ -189,6 +221,10 @@ fn first_string(value: &serde_json::Value) -> Option<String> {
     value
         .as_array()
         .and_then(|items| items.iter().find_map(first_string))
+}
+
+fn clean_cookie(cookie: Option<&str>) -> Option<&str> {
+    cookie.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn extract_json_object_after(html: &str, start_index: usize) -> Option<&str> {
@@ -288,6 +324,10 @@ mod tests {
         assert_eq!(
             provider_for_url("https://www.tiktok.com/@demo/video/123"),
             Some(Provider::TikTok)
+        );
+        assert_eq!(
+            provider_for_url("https://www.facebook.com/reel/123"),
+            Some(Provider::Facebook)
         );
         assert_eq!(provider_for_url("https://example.com/video"), None);
         assert_eq!(provider_for_url("file:///etc/passwd"), None);

@@ -6,6 +6,8 @@ pub enum Platform {
     YouTube,
     #[serde(rename = "tiktok")]
     TikTok,
+    #[serde(rename = "facebook")]
+    Facebook,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

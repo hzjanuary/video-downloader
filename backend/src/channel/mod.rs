@@ -45,6 +45,7 @@ impl ChannelError {
 enum Provider {
     YouTube,
     TikTok,
+    Facebook,
 }
 
 #[derive(Clone)]
@@ -70,6 +71,7 @@ struct YouTubeContinuation {
 struct TikTokCursor {
     sec_uid: Option<String>,
     cursor: String,
+    referer: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +80,22 @@ struct TikTokPage {
     cursor: Option<String>,
     has_more: bool,
     sec_uid: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FacebookCursor {
+    source_url: String,
+    next_url: Option<String>,
+    cursor: Option<String>,
+    cookie: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FacebookPage {
+    videos: Vec<ChannelVideo>,
+    next_url: Option<String>,
+    cursor: Option<String>,
+    has_more: bool,
 }
 
 impl ChannelFetcher {
@@ -100,10 +118,20 @@ impl ChannelFetcher {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn fetch_channel(&self, source_url: &str) -> Result<Vec<ChannelVideo>, ChannelError> {
+        self.fetch_channel_with_cookie(source_url, None).await
+    }
+
+    pub async fn fetch_channel_with_cookie(
+        &self,
+        source_url: &str,
+        cookie: Option<&str>,
+    ) -> Result<Vec<ChannelVideo>, ChannelError> {
         match provider_for_url(source_url).ok_or(ChannelError::UnsupportedUrl)? {
             Provider::YouTube => self.fetch_youtube_channel(source_url).await,
             Provider::TikTok => self.fetch_tiktok_profile(source_url).await,
+            Provider::Facebook => self.fetch_facebook_collection(source_url, cookie).await,
         }
     }
 
@@ -165,19 +193,30 @@ impl ChannelFetcher {
         let html = self.fetch_get(source_url).await?;
         let initial_json = parse_tiktok_state(&html)?;
         let initial_page = parse_tiktok_page(&initial_json);
+        let initial_video_count = initial_page.videos.len();
+        let initial_sec_uid = initial_page.sec_uid.clone();
+        let initial_cursor = if initial_page.has_more {
+            initial_page.cursor.clone()
+        } else if initial_video_count == 0 && initial_sec_uid.is_some() {
+            Some(
+                initial_page
+                    .cursor
+                    .clone()
+                    .unwrap_or_else(|| "0".to_string()),
+            )
+        } else {
+            None
+        };
         let mut videos = Vec::new();
         let mut seen_videos = HashSet::new();
 
         push_unique_videos(&mut videos, &mut seen_videos, initial_page.videos);
 
-        let mut cursor = initial_page
-            .has_more
-            .then_some(initial_page.cursor)
-            .flatten()
-            .map(|cursor| TikTokCursor {
-                sec_uid: initial_page.sec_uid,
-                cursor,
-            });
+        let mut cursor = initial_cursor.map(|cursor| TikTokCursor {
+            sec_uid: initial_sec_uid,
+            cursor,
+            referer: Some(source_url.to_string()),
+        });
         let mut seen_cursors = HashSet::new();
         let mut pages = 1usize;
 
@@ -200,6 +239,7 @@ impl ChannelFetcher {
                 .map(|next| TikTokCursor {
                     sec_uid: parsed.sec_uid.or_else(|| request.sec_uid.clone()),
                     cursor: next,
+                    referer: request.referer.clone(),
                 });
             pages += 1;
         }
@@ -211,7 +251,78 @@ impl ChannelFetcher {
         Ok(videos)
     }
 
+    async fn fetch_facebook_collection(
+        &self,
+        source_url: &str,
+        cookie: Option<&str>,
+    ) -> Result<Vec<ChannelVideo>, ChannelError> {
+        let html = self.fetch_get_with_cookie(source_url, cookie).await?;
+        let initial_page = parse_facebook_page(&html);
+        let mut videos = Vec::new();
+        let mut seen_videos = HashSet::new();
+
+        push_unique_videos(&mut videos, &mut seen_videos, initial_page.videos);
+
+        let mut cursor = initial_page
+            .has_more
+            .then_some(FacebookCursor {
+                source_url: source_url.to_string(),
+                next_url: initial_page.next_url,
+                cursor: initial_page.cursor,
+                cookie: cookie.map(ToOwned::to_owned),
+            })
+            .filter(|request| request.next_url.is_some() || request.cursor.is_some());
+        let mut seen_cursors = HashSet::new();
+        let mut pages = 1usize;
+
+        while let Some(request) = cursor.take() {
+            if pages >= MAX_PAGES {
+                break;
+            }
+
+            let cursor_key = request
+                .next_url
+                .clone()
+                .or_else(|| request.cursor.clone())
+                .unwrap_or_default();
+
+            if !seen_cursors.insert(cursor_key) {
+                break;
+            }
+
+            self.delay_between_pages().await;
+            let page = self.fetch_facebook_cursor(&request).await?;
+            let parsed = parse_facebook_page(&page);
+            push_unique_videos(&mut videos, &mut seen_videos, parsed.videos);
+
+            cursor = parsed
+                .has_more
+                .then_some(FacebookCursor {
+                    source_url: request.source_url,
+                    next_url: parsed.next_url,
+                    cursor: parsed.cursor,
+                    cookie: request.cookie,
+                })
+                .filter(|next| next.next_url.is_some() || next.cursor.is_some());
+            pages += 1;
+        }
+
+        if videos.is_empty() {
+            return Err(ChannelError::NoVideos);
+        }
+
+        Ok(videos)
+    }
+
     async fn fetch_get(&self, url: &str) -> Result<String, ChannelError> {
+        self.fetch_get_with_cookie(url, None).await
+    }
+
+    async fn fetch_get_with_cookie(
+        &self,
+        url: &str,
+        cookie: Option<&str>,
+    ) -> Result<String, ChannelError> {
         match &self.fetcher {
             PageFetcher::Live(client) => {
                 let mut last_error = None;
@@ -221,7 +332,13 @@ impl ChannelFetcher {
                         sleep(retry_delay(attempt)).await;
                     }
 
-                    match client.get(url).send().await {
+                    let mut request = client.get(url);
+
+                    if let Some(cookie) = clean_cookie(cookie) {
+                        request = request.header(reqwest::header::COOKIE, cookie);
+                    }
+
+                    match request.send().await {
                         Ok(response) if response.status().is_success() => {
                             return response
                                 .text()
@@ -244,6 +361,51 @@ impl ChannelFetcher {
                 .get(url)
                 .cloned()
                 .ok_or_else(|| ChannelError::FetchFailed(format!("fixture not found: {url}"))),
+        }
+    }
+
+    async fn fetch_facebook_cursor(
+        &self,
+        request: &FacebookCursor,
+    ) -> Result<String, ChannelError> {
+        match &self.fetcher {
+            PageFetcher::Live(_) => {
+                let endpoint = request
+                    .next_url
+                    .clone()
+                    .or_else(|| {
+                        request
+                            .cursor
+                            .as_deref()
+                            .map(|cursor| append_query_param(&request.source_url, "cursor", cursor))
+                    })
+                    .ok_or(ChannelError::MissingField("facebook cursor"))?;
+
+                self.fetch_get_with_cookie(&endpoint, request.cookie.as_deref())
+                    .await
+            }
+            #[cfg(test)]
+            PageFetcher::Fixture(fixtures) => {
+                if let Some(next_url) = &request.next_url {
+                    return fixtures.get(next_url).cloned().ok_or_else(|| {
+                        ChannelError::FetchFailed(format!("fixture not found: {next_url}"))
+                    });
+                }
+
+                let cursor = request
+                    .cursor
+                    .as_deref()
+                    .ok_or(ChannelError::MissingField("facebook cursor"))?;
+
+                fixtures
+                    .get(&format!("facebook:cursor:{cursor}"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        ChannelError::FetchFailed(format!(
+                            "fixture not found: facebook:cursor:{cursor}"
+                        ))
+                    })
+            }
         }
     }
 
@@ -308,7 +470,7 @@ impl ChannelFetcher {
                     .as_deref()
                     .ok_or(ChannelError::MissingField("secUid"))?;
                 let endpoint = format!(
-                    "https://www.tiktok.com/api/post/item_list/?aid=1988&count=35&cursor={}&secUid={}",
+                    "https://www.tiktok.com/api/post/item_list/?aid=1988&app_language=en&app_name=tiktok_web&browser_language=en-US&browser_name=Mozilla&browser_online=true&browser_platform=Win32&browser_version=5.0&channel=tiktok_web&count=35&cursor={}&device_platform=web_pc&focus_state=true&from_page=user&history_len=2&is_fullscreen=false&is_page_visible=true&language=en&region=US&screen_height=1080&screen_width=1920&secUid={}&tz_name=UTC&user_is_login=false&webcast_language=en",
                     request.cursor, sec_uid
                 );
                 let mut last_error = None;
@@ -318,12 +480,33 @@ impl ChannelFetcher {
                         sleep(retry_delay(attempt)).await;
                     }
 
-                    match client.get(&endpoint).send().await {
+                    let referer = request
+                        .referer
+                        .as_deref()
+                        .unwrap_or("https://www.tiktok.com/");
+
+                    match client
+                        .get(&endpoint)
+                        .header("accept", "application/json, text/plain, */*")
+                        .header("accept-language", "en-US,en;q=0.9")
+                        .header("referer", referer)
+                        .send()
+                        .await
+                    {
                         Ok(response) if response.status().is_success() => {
-                            return response
+                            let text = response
                                 .text()
                                 .await
-                                .map_err(|error| ChannelError::FetchFailed(error.to_string()));
+                                .map_err(|error| ChannelError::FetchFailed(error.to_string()))?;
+
+                            if text.trim().is_empty() {
+                                return Err(ChannelError::FetchFailed(
+                                    "TikTok returned an empty cursor response; profile feed API may require browser verification"
+                                        .to_string(),
+                                ));
+                            }
+
+                            return Ok(text);
                         }
                         Ok(response) => {
                             last_error = Some(format!("provider returned {}", response.status()));
@@ -377,6 +560,14 @@ fn provider_for_url(source_url: &str) -> Option<Provider> {
 
     if (host == "tiktok.com" || host.ends_with(".tiktok.com")) && path.starts_with("/@") {
         return Some(Provider::TikTok);
+    }
+
+    if host == "fb.watch"
+        || host.ends_with(".fb.watch")
+        || host == "facebook.com"
+        || host.ends_with(".facebook.com")
+    {
+        return Some(Provider::Facebook);
     }
 
     None
@@ -436,10 +627,19 @@ fn parse_youtube_context(html: &str) -> Option<Value> {
 
 fn parse_ytcfg(html: &str) -> Option<Value> {
     let marker = Regex::new(r#"ytcfg\.set\s*\("#).unwrap();
-    let start = marker.find(html)?.end();
-    let json = extract_json_object_after(html, start)?;
 
-    serde_json::from_str(json).ok()
+    let config = marker.find_iter(html).find_map(|match_| {
+        let start = skip_ascii_whitespace(html, match_.end());
+
+        if html.as_bytes().get(start) != Some(&b'{') {
+            return None;
+        }
+
+        let json = extract_json_object_after(html, start)?;
+        serde_json::from_str(json).ok()
+    });
+
+    config
 }
 
 fn default_youtube_context() -> Value {
@@ -484,6 +684,14 @@ fn collect_youtube_videos(
                 }
             }
 
+            if let Some(lockup) = object.get("lockupViewModel") {
+                if let Some(video) = youtube_video_from_lockup(lockup) {
+                    if seen.insert(video.id.clone()) {
+                        videos.push(video);
+                    }
+                }
+            }
+
             for item in object.values() {
                 collect_youtube_videos(item, videos, seen);
             }
@@ -512,7 +720,43 @@ fn youtube_video_from_renderer(renderer: &Value) -> Option<ChannelVideo> {
     Some(ChannelVideo {
         id,
         title: renderer.get("title").and_then(text_from_value),
-        thumbnail_url: best_thumbnail_url(renderer.get("thumbnail")?),
+        thumbnail_url: renderer.get("thumbnail").and_then(best_thumbnail_url),
+    })
+}
+
+fn youtube_video_from_lockup(lockup: &Value) -> Option<ChannelVideo> {
+    let id = lockup
+        .get("contentId")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            lockup
+                .pointer(
+                    "/rendererContext/commandContext/onTap/innertubeCommand/watchEndpoint/videoId",
+                )
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        })?;
+
+    let title = lockup
+        .pointer("/metadata/lockupMetadataViewModel/title/content")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            lockup
+                .pointer("/metadata/lockupMetadataViewModel/title")
+                .and_then(text_from_value)
+        });
+
+    let thumbnail_url = lockup
+        .pointer("/contentImage/thumbnailViewModel/image")
+        .and_then(best_thumbnail_url)
+        .or_else(|| lockup.get("contentImage").and_then(best_thumbnail_url));
+
+    Some(ChannelVideo {
+        id,
+        title,
+        thumbnail_url,
     })
 }
 
@@ -560,7 +804,14 @@ fn parse_tiktok_state(html: &str) -> Result<Value, ChannelError> {
             .map_err(|error| ChannelError::InvalidJson(error.to_string()));
     }
 
-    Err(ChannelError::MissingJson("SIGI_STATE or __NEXT_DATA__"))
+    if let Some(json) = script_json_by_id(html, "__UNIVERSAL_DATA_FOR_REHYDRATION__") {
+        return serde_json::from_str(json)
+            .map_err(|error| ChannelError::InvalidJson(error.to_string()));
+    }
+
+    Err(ChannelError::MissingJson(
+        "SIGI_STATE, __NEXT_DATA__, or __UNIVERSAL_DATA_FOR_REHYDRATION__",
+    ))
 }
 
 fn parse_tiktok_page(value: &Value) -> TikTokPage {
@@ -573,6 +824,239 @@ fn parse_tiktok_page(value: &Value) -> TikTokPage {
         cursor: find_cursor(value),
         has_more: find_has_more(value),
         sec_uid: find_key_string(value, "secUid"),
+    }
+}
+
+fn parse_facebook_page(html: &str) -> FacebookPage {
+    let decoded_html = decode_html_entities(html);
+    let mut videos = Vec::new();
+    let mut seen = HashSet::new();
+
+    collect_facebook_video_links(&decoded_html, &mut videos, &mut seen);
+
+    let values = parse_json_scripts(&decoded_html);
+    let mut cursor = None;
+    let mut has_more = false;
+
+    for value in &values {
+        collect_facebook_videos_from_json(value, &mut videos, &mut seen);
+
+        if cursor.is_none() {
+            cursor = find_facebook_cursor(value);
+        }
+
+        has_more = has_more || find_facebook_has_more(value);
+    }
+
+    let next_url = find_facebook_next_url(&decoded_html);
+    has_more = has_more || next_url.is_some();
+
+    FacebookPage {
+        videos,
+        next_url,
+        cursor,
+        has_more,
+    }
+}
+
+fn collect_facebook_video_links(
+    html: &str,
+    videos: &mut Vec<ChannelVideo>,
+    seen: &mut HashSet<String>,
+) {
+    for pattern in [
+        r#"(?:https?://(?:www\.|m\.|web\.)?facebook\.com)?/(?:watch/\?v=|reel/)(\d{5,})"#,
+        r#"(?:https?://(?:www\.|m\.|web\.)?facebook\.com)?/[^/"'<>?]+/videos/(\d{5,})"#,
+        r#"[?&](?:v|video_id)=(\d{5,})"#,
+        r#""(?:videoID|video_id|videoId)"\s*:\s*"?(\d{5,})"?"#,
+    ] {
+        let regex = Regex::new(pattern).unwrap();
+
+        for captures in regex.captures_iter(html) {
+            let Some(id) = captures.get(1).map(|match_| match_.as_str().to_string()) else {
+                continue;
+            };
+
+            if seen.insert(id.clone()) {
+                videos.push(ChannelVideo {
+                    id,
+                    title: None,
+                    thumbnail_url: None,
+                });
+            }
+        }
+    }
+}
+
+fn collect_facebook_videos_from_json(
+    value: &Value,
+    videos: &mut Vec<ChannelVideo>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        Value::Object(object) => {
+            if let Some(video) = facebook_video_from_object(value) {
+                if let Some(existing) = videos.iter_mut().find(|item| item.id == video.id) {
+                    if existing.title.is_none() {
+                        existing.title = video.title;
+                    }
+                    if existing.thumbnail_url.is_none() {
+                        existing.thumbnail_url = video.thumbnail_url;
+                    }
+                } else if seen.insert(video.id.clone()) {
+                    videos.push(video);
+                }
+            }
+
+            for item in object.values() {
+                collect_facebook_videos_from_json(item, videos, seen);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_facebook_videos_from_json(item, videos, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn facebook_video_from_object(value: &Value) -> Option<ChannelVideo> {
+    let object = value.as_object()?;
+    let id = object
+        .get("videoID")
+        .or_else(|| object.get("video_id"))
+        .or_else(|| object.get("videoId"))
+        .or_else(|| object.get("id"))
+        .and_then(first_string)
+        .filter(|id| is_numeric_video_id(id))?;
+
+    if !is_facebook_video_object(value) {
+        return None;
+    }
+
+    let title = object
+        .get("title")
+        .or_else(|| object.get("name"))
+        .or_else(|| object.get("message"))
+        .or_else(|| object.get("description"))
+        .and_then(first_string);
+    let thumbnail_url = object
+        .get("thumbnail_url")
+        .or_else(|| object.get("thumbnailUrl"))
+        .or_else(|| object.get("picture"))
+        .or_else(|| object.get("image"))
+        .and_then(first_string)
+        .or_else(|| {
+            value
+                .pointer("/thumbnail/uri")
+                .or_else(|| value.pointer("/thumbnail/image/uri"))
+                .or_else(|| value.pointer("/preferred_thumbnail/image/uri"))
+                .or_else(|| value.pointer("/image/uri"))
+                .and_then(first_string)
+        });
+
+    Some(ChannelVideo {
+        id,
+        title,
+        thumbnail_url,
+    })
+}
+
+fn is_facebook_video_object(value: &Value) -> bool {
+    let typename = value
+        .get("__typename")
+        .or_else(|| value.get("__isNode"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if typename.contains("video") || typename.contains("reel") {
+        return true;
+    }
+
+    for key in [
+        "playable_url",
+        "playable_url_quality_hd",
+        "browser_native_hd_url",
+        "browser_native_sd_url",
+        "video",
+    ] {
+        if value.get(key).is_some() {
+            return true;
+        }
+    }
+
+    ["url", "permalink_url", "permalinkUrl"]
+        .into_iter()
+        .any(|key| {
+            value
+                .get(key)
+                .and_then(first_string)
+                .is_some_and(|url| is_facebook_video_url(&url))
+        })
+}
+
+fn find_facebook_next_url(html: &str) -> Option<String> {
+    let href_pattern = Regex::new(r#"(?is)<a[^>]+href=["']([^"']+)["'][^>]*>"#).unwrap();
+
+    let next_url = href_pattern
+        .captures_iter(html)
+        .filter_map(|captures| captures.get(1))
+        .map(|match_| decode_html_entities(match_.as_str()))
+        .find(|href| {
+            href.contains("cursor=")
+                || href.contains("after=")
+                || href.contains("pagination")
+                || href.contains("page_info")
+        })
+        .map(|href| absolute_facebook_url(&href));
+
+    next_url
+}
+
+fn find_facebook_cursor(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(object) => {
+            if object
+                .get("has_next_page")
+                .or_else(|| object.get("hasNextPage"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                if let Some(cursor) = object
+                    .get("end_cursor")
+                    .or_else(|| object.get("endCursor"))
+                    .or_else(|| object.get("cursor"))
+                    .and_then(first_string)
+                {
+                    return Some(cursor);
+                }
+            }
+
+            object.values().find_map(find_facebook_cursor)
+        }
+        Value::Array(items) => items.iter().find_map(find_facebook_cursor),
+        _ => None,
+    }
+}
+
+fn find_facebook_has_more(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            if object
+                .get("has_next_page")
+                .or_else(|| object.get("hasNextPage"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+
+            object.values().any(find_facebook_has_more)
+        }
+        Value::Array(items) => items.iter().any(find_facebook_has_more),
+        _ => false,
     }
 }
 
@@ -721,16 +1205,26 @@ fn text_from_value(value: &Value) -> Option<String> {
 }
 
 fn best_thumbnail_url(value: &Value) -> Option<String> {
-    value
-        .get("thumbnails")
-        .and_then(|items| items.as_array())
-        .and_then(|items| {
-            items
-                .iter()
-                .rev()
-                .find_map(|item| item.get("url").and_then(|url| url.as_str()))
+    ["thumbnails", "sources"]
+        .into_iter()
+        .find_map(|key| {
+            value
+                .get(key)
+                .and_then(|items| items.as_array())
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .rev()
+                        .find_map(|item| item.get("url").and_then(|url| url.as_str()))
+                })
+                .map(ToOwned::to_owned)
         })
-        .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("url")
+                .and_then(|url| url.as_str())
+                .map(ToOwned::to_owned)
+        })
         .or_else(|| first_string(value))
 }
 
@@ -742,6 +1236,98 @@ fn first_string(value: &Value) -> Option<String> {
     value
         .as_array()
         .and_then(|items| items.iter().find_map(first_string))
+}
+
+fn parse_json_scripts(html: &str) -> Vec<Value> {
+    let script = Regex::new(r#"(?s)<script[^>]*>(.*?)</script>"#).unwrap();
+    let mut values = Vec::new();
+
+    for captures in script.captures_iter(html) {
+        let Some(match_) = captures.get(1) else {
+            continue;
+        };
+        let mut text = match_.as_str().trim();
+
+        if let Some(stripped) = text.strip_prefix("for (;;);") {
+            text = stripped.trim();
+        }
+
+        if !text.starts_with('{') && !text.starts_with('[') {
+            continue;
+        }
+
+        if let Ok(value) = serde_json::from_str(text) {
+            values.push(value);
+        }
+    }
+
+    values
+}
+
+fn is_numeric_video_id(id: &str) -> bool {
+    id.len() >= 5 && id.chars().all(|character| character.is_ascii_digit())
+}
+
+fn is_facebook_video_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+
+    lower.contains("facebook.com/watch")
+        || lower.contains("/videos/")
+        || lower.contains("/reel/")
+        || lower.contains("video_id=")
+        || lower.contains("?v=")
+}
+
+fn absolute_facebook_url(href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+
+    if href.starts_with("//") {
+        return format!("https:{href}");
+    }
+
+    if href.starts_with('/') {
+        return format!("https://www.facebook.com{href}");
+    }
+
+    format!("https://www.facebook.com/{href}")
+}
+
+fn append_query_param(url: &str, key: &str, value: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+
+    format!("{url}{separator}{key}={}", percent_encode(value))
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+
+    encoded
+}
+
+fn clean_cookie(cookie: Option<&str>) -> Option<&str> {
+    cookie.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn decode_html_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#034;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 fn script_json_by_id<'a>(html: &'a str, id: &str) -> Option<&'a str> {
@@ -803,6 +1389,15 @@ fn extract_json_object_after(html: &str, start_index: usize) -> Option<&str> {
     None
 }
 
+fn skip_ascii_whitespace(text: &str, start_index: usize) -> usize {
+    text.as_bytes()
+        .iter()
+        .enumerate()
+        .skip(start_index)
+        .find_map(|(index, byte)| (!byte.is_ascii_whitespace()).then_some(index))
+        .unwrap_or(text.len())
+}
+
 fn dedupe_strings(items: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     items
@@ -817,6 +1412,7 @@ pub(crate) mod tests {
 
     const YOUTUBE_CHANNEL_URL: &str = "https://www.youtube.com/@fixture/videos";
     const TIKTOK_PROFILE_URL: &str = "https://www.tiktok.com/@fixture";
+    const FACEBOOK_PAGE_URL: &str = "https://www.facebook.com/fixture/videos";
 
     #[tokio::test]
     async fn youtube_channel_follows_continuations_until_complete() {
@@ -868,6 +1464,66 @@ pub(crate) mod tests {
         assert_eq!(videos[4].thumbnail_url.as_deref(), Some("https://tt/5.jpg"));
     }
 
+    #[tokio::test]
+    async fn youtube_channel_reads_lockup_view_model_tiles() {
+        let fetcher = ChannelFetcher::fixture([(
+            YOUTUBE_CHANNEL_URL.to_string(),
+            youtube_lockup_html().to_string(),
+        )]);
+
+        let videos = fetcher.fetch_channel(YOUTUBE_CHANNEL_URL).await.unwrap();
+
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].id, "lock001");
+        assert_eq!(videos[0].title.as_deref(), Some("YouTube lockup"));
+        assert_eq!(
+            videos[0].thumbnail_url.as_deref(),
+            Some("https://yt/lock-large.jpg")
+        );
+    }
+
+    #[tokio::test]
+    async fn tiktok_universal_hydration_uses_zero_cursor_when_feed_is_empty() {
+        let fetcher = ChannelFetcher::fixture([
+            (
+                TIKTOK_PROFILE_URL.to_string(),
+                tiktok_universal_empty_html().to_string(),
+            ),
+            (
+                "tiktok:cursor:0".to_string(),
+                tiktok_cursor_zero().to_string(),
+            ),
+        ]);
+
+        let videos = fetcher.fetch_channel(TIKTOK_PROFILE_URL).await.unwrap();
+
+        assert_eq!(videos.len(), 1);
+        assert_eq!(videos[0].id, "tt000");
+        assert_eq!(videos[0].title.as_deref(), Some("TikTok zero"));
+    }
+
+    #[tokio::test]
+    async fn facebook_page_follows_cursor_until_complete() {
+        let fetcher = ChannelFetcher::fixture([
+            (
+                FACEBOOK_PAGE_URL.to_string(),
+                facebook_initial_html().to_string(),
+            ),
+            (
+                "facebook:cursor:FB_CURSOR_1".to_string(),
+                facebook_cursor_one().to_string(),
+            ),
+        ]);
+
+        let videos = fetcher.fetch_channel(FACEBOOK_PAGE_URL).await.unwrap();
+
+        assert_eq!(videos.len(), 3);
+        assert_eq!(videos[0].id, "111111111111111");
+        assert_eq!(videos[0].title.as_deref(), Some("Facebook one"));
+        assert_eq!(videos[2].id, "333333333333333");
+        assert_eq!(videos[2].thumbnail_url.as_deref(), Some("https://fb/3.jpg"));
+    }
+
     #[test]
     fn rejects_non_channel_urls() {
         assert_eq!(
@@ -881,6 +1537,23 @@ pub(crate) mod tests {
         assert_eq!(
             provider_for_url("https://www.youtube.com/playlist?list=PL123"),
             Some(Provider::YouTube)
+        );
+        assert_eq!(
+            provider_for_url("https://www.facebook.com/fixture/videos"),
+            Some(Provider::Facebook)
+        );
+    }
+
+    #[test]
+    fn parses_ytcfg_object_after_scalar_setter() {
+        let html = r#"
+          <script>window.ytcfg.set('EMERGENCY_BASE_URL', '/error_204');</script>
+          <script>ytcfg.set({"INNERTUBE_API_KEY": "key-after-scalar"});</script>
+        "#;
+
+        assert_eq!(
+            parse_youtube_api_key(html).as_deref(),
+            Some("key-after-scalar")
         );
     }
 
@@ -907,6 +1580,31 @@ pub(crate) mod tests {
                   {"continuationItemRenderer": {
                     "continuationEndpoint": {"continuationCommand": {"token": "YT_CONT_1"}}
                   }}
+                ]
+              };
+            </script>
+          </html>
+        "#
+    }
+
+    pub(crate) fn youtube_lockup_html() -> &'static str {
+        r#"
+          <html>
+            <script>
+              var ytInitialData = {
+                "contents": [
+                  {"richItemRenderer": {"content": {"lockupViewModel": {
+                    "contentId": "lock001",
+                    "contentType": "LOCKUP_CONTENT_TYPE_VIDEO",
+                    "contentImage": {"thumbnailViewModel": {"image": {"sources": [
+                      {"url": "https://yt/lock-small.jpg", "width": 168, "height": 94},
+                      {"url": "https://yt/lock-large.jpg", "width": 336, "height": 188}
+                    ]}}},
+                    "metadata": {"lockupMetadataViewModel": {"title": {"content": "YouTube lockup"}}},
+                    "rendererContext": {"commandContext": {"onTap": {"innertubeCommand": {
+                      "watchEndpoint": {"videoId": "lock001"}
+                    }}}}
+                  }}}}
                 ]
               };
             </script>
@@ -965,6 +1663,104 @@ pub(crate) mod tests {
                 },
                 "UserModule": {"users": {"fixture": {"secUid": "SEC_UID"}}},
                 "UserPage": {"cursor": "20", "hasMore": true}
+              }
+            </script>
+          </html>
+        "#
+    }
+
+    pub(crate) fn tiktok_universal_empty_html() -> &'static str {
+        r#"
+          <html>
+            <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">
+              {
+                "__DEFAULT_SCOPE__": {
+                  "webapp.user-detail": {
+                    "userInfo": {
+                      "user": {"secUid": "SEC_UID", "uniqueId": "fixture"},
+                      "itemList": []
+                    }
+                  }
+                }
+              }
+            </script>
+          </html>
+        "#
+    }
+
+    pub(crate) fn tiktok_cursor_zero() -> &'static str {
+        r#"
+          {
+            "itemList": [
+              {"id": "tt000", "desc": "TikTok zero", "video": {"cover": "https://tt/0.jpg"}}
+            ],
+            "cursor": "20",
+            "hasMore": false
+          }
+        "#
+    }
+
+    pub(crate) fn facebook_initial_html() -> &'static str {
+        r#"
+          <html>
+            <script type="application/json">
+              {
+                "data": {
+                  "page": {
+                    "videos": {
+                      "edges": [
+                        {"node": {
+                          "__typename": "Video",
+                          "id": "111111111111111",
+                          "title": "Facebook one",
+                          "thumbnail": {"uri": "https://fb/1.jpg"},
+                          "url": "https://www.facebook.com/watch/?v=111111111111111"
+                        }},
+                        {"node": {
+                          "__typename": "Reel",
+                          "id": "222222222222222",
+                          "description": "Facebook two",
+                          "preferred_thumbnail": {"image": {"uri": "https://fb/2.jpg"}},
+                          "permalink_url": "https://www.facebook.com/reel/222222222222222"
+                        }}
+                      ],
+                      "page_info": {
+                        "has_next_page": true,
+                        "end_cursor": "FB_CURSOR_1"
+                      }
+                    }
+                  }
+                }
+              }
+            </script>
+          </html>
+        "#
+    }
+
+    pub(crate) fn facebook_cursor_one() -> &'static str {
+        r#"
+          <html>
+            <script type="application/json">
+              {
+                "data": {
+                  "page": {
+                    "videos": {
+                      "edges": [
+                        {"node": {
+                          "__typename": "Video",
+                          "id": "333333333333333",
+                          "name": "Facebook three",
+                          "thumbnail_url": "https://fb/3.jpg",
+                          "url": "https://www.facebook.com/watch/?v=333333333333333"
+                        }}
+                      ],
+                      "page_info": {
+                        "has_next_page": false,
+                        "end_cursor": "FB_CURSOR_2"
+                      }
+                    }
+                  }
+                }
               }
             </script>
           </html>

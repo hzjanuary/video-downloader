@@ -23,6 +23,7 @@ type SaveFilePicker = (options: {
 
 export default function Home() {
   const [sourceUrl, setSourceUrl] = useState("");
+  const [cookie, setCookie] = useState("");
   const [videos, setVideos] = useState<ChannelVideo[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("Ready");
@@ -49,8 +50,15 @@ export default function Home() {
     setStatus("Fetching videos...");
 
     try {
+      const params = new URLSearchParams({ url });
+      const cleanCookie = cookie.trim();
+
+      if (cleanCookie) {
+        params.set("cookie", cleanCookie);
+      }
+
       const response = await fetch(
-        `${normalizedApiBaseUrl}/api/channel?url=${encodeURIComponent(url)}`,
+        `${normalizedApiBaseUrl}/api/channel?${params.toString()}`,
       );
 
       if (!response.ok) {
@@ -90,6 +98,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           source_url: sourceUrl.trim(),
+          cookie: cookie.trim() || undefined,
           ids,
         }),
       });
@@ -156,6 +165,14 @@ export default function Home() {
               {isFetching ? "Fetching..." : "Fetch"}
             </button>
           </div>
+          <label htmlFor="provider-cookie">Cookie</label>
+          <textarea
+            id="provider-cookie"
+            name="provider-cookie"
+            placeholder="c_user=...; xs=..."
+            value={cookie}
+            onChange={(event) => setCookie(event.target.value)}
+          />
         </form>
 
         <div className="toolbar">

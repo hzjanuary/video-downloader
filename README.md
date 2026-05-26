@@ -1,9 +1,9 @@
 # Video Downloader
 
 Full-stack video downloader workspace with a Next.js frontend and a Rust Axum
-backend. The app accepts YouTube channel/playlist URLs and TikTok profile URLs,
-lists videos, lets the user select one or many items, and streams a ZIP archive
-back to the browser.
+backend. The app accepts YouTube channel/playlist URLs, TikTok profile URLs, and
+Facebook video/Page/Profile URLs, lists videos, lets the user select one or many
+items, and streams a ZIP archive back to the browser.
 
 This repository also includes Harness documentation and story tracking under
 `docs/` and `scripts/harness`.
@@ -18,6 +18,9 @@ This repository also includes Harness documentation and story tracking under
 - Bulk download: `POST /api/download/bulk`.
 - YouTube channel/user/handle/playlist pagination through continuation tokens.
 - TikTok profile pagination through cursor/max_cursor.
+- Facebook single video/Reels MP4 extraction and Page/Profile video listing
+  from exposed HTML/JSON data.
+- Optional provider cookie forwarding for Facebook auth-wall cases.
 - Streaming ZIP response with concurrent Tokio download tasks.
 
 ## Tech Stack
@@ -39,7 +42,7 @@ frontend/
 backend/
   src/
     bulk.rs             ZIP streaming bulk download worker
-    channel/            YouTube/TikTok channel and profile crawlers
+    channel/            YouTube/TikTok/Facebook collection crawlers
     extract/            Single-video extraction parsers
     main.rs             Axum routes and app wiring
     model.rs            Shared response models
@@ -109,7 +112,8 @@ OK: backend is healthy
 
 ### `GET /api/extract?url={link}`
 
-Fetches a single YouTube or TikTok video page and returns normalized metadata:
+Fetches a single YouTube, TikTok, or Facebook video page and returns normalized
+metadata:
 
 ```json
 {
@@ -146,6 +150,7 @@ Supported inputs:
 - YouTube `/@handle/...`
 - YouTube `/playlist?list=...`
 - TikTok `/@username`
+- Facebook Page/Profile video URLs on `facebook.com` / `*.facebook.com`
 
 ### `POST /api/download/bulk`
 
@@ -154,6 +159,7 @@ Request:
 ```json
 {
   "source_url": "https://www.youtube.com/@channel/videos",
+  "cookie": "optional provider cookie",
   "ids": ["video-id-1", "video-id-2"]
 }
 ```
@@ -169,7 +175,7 @@ HTTP response instead of writing temporary files or buffering the full archive.
 
 ## Frontend Workflow
 
-1. Paste a YouTube channel/playlist or TikTok profile URL.
+1. Paste a YouTube channel/playlist, TikTok profile, or Facebook URL.
 2. Click `Fetch`.
 3. Select individual videos or use `Chọn tất cả`.
 4. Click `Tải xuống x video`.
@@ -203,6 +209,6 @@ scripts/harness query matrix
 ## Notes
 
 - Provider HTML and pagination APIs are volatile. Tests use deterministic
-  fixtures for YouTube and TikTok parsing/pagination behavior.
+  fixtures for YouTube, TikTok, and Facebook parsing/pagination behavior.
 - The bulk ZIP writer currently targets normal ZIP archives, not Zip64.
 - This project intentionally does not use `yt-dlp` or provider wrapper modules.
