@@ -10,7 +10,7 @@ because those pages are volatile and network-dependent.
 
 | Layer | Cases |
 | --- | --- |
-| Unit | Model serialization, provider detection, balanced JSON extraction, YouTube parser, TikTok SIGI parser, TikTok Next data parser |
+| Unit | Model serialization, provider detection, balanced JSON extraction, YouTube InnerTube parser, TikTok SIGI parser, TikTok Next data parser |
 | Integration | `/api/extract` route returns normalized YouTube and TikTok metadata with fixture-backed fetcher |
 | E2E | Not required; no frontend flow in this slice |
 | Platform | `cargo fmt --check`, `cargo check --offline`, `cargo test --offline` |
@@ -19,7 +19,7 @@ because those pages are volatile and network-dependent.
 
 ## Fixtures
 
-- YouTube HTML containing `ytInitialPlayerResponse`.
+- YouTube InnerTube player JSON containing `videoDetails` and `streamingData`.
 - TikTok HTML containing `SIGI_STATE`.
 - TikTok HTML containing `__NEXT_DATA__`.
 

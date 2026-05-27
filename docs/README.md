@@ -16,16 +16,11 @@ future user-provided spec.
 
 ## Folders
 
-- `product/`: current product truth, empty until a spec is derived.
-- `stories/`: feature packets and backlog.
+- `product/`: current product truth and API/platform contracts.
+- `stories/`: epic packets and historical validation records for US-001 through US-012.
 - `decisions/`: durable decisions and tradeoffs.
-- `demo/`: concrete walkthroughs that show how the harness transforms input
-  into agent-ready work.
-- `templates/`: reusable spec-intake, story, plan, decision, and validation
-  formats.
+- `templates/`: reusable spec-intake, story, plan, decision, and validation formats.
 
 ## Current State
 
-Harness v0 exists before implementation. These docs define how the project will
-grow; they do not imply that app code, tests, CI, or deployment automation exist
-yet.
+The project is fully implemented (Harness v1). Next.js frontend, Rust Axum backend, and all 12 user stories (US-001 through US-012) are fully functional, verified by automated unit/integration tests and Harness verification CLI commands.

@@ -10,8 +10,9 @@ high-risk
 
 ## Product Contract
 
-The backend fetches YouTube HTML and parses `ytInitialPlayerResponse` directly
-to produce normalized `VideoInfo`.
+The backend calls the YouTube InnerTube player endpoint with an Android client
+context and parses the JSON response directly to produce normalized
+`VideoInfo`.
 
 ## Relevant Product Docs
 
@@ -19,11 +20,14 @@ to produce normalized `VideoInfo`.
 
 ## Acceptance Criteria
 
-- Uses `reqwest` for HTML fetch in the extractor path.
-- Uses `regex` to locate `ytInitialPlayerResponse`.
+- Uses `reqwest` to POST to `https://www.youtube.com/youtubei/v1/player`.
+- Sends `context.client.clientName = "ANDROID"` with the current working
+  Android client version used by the backend.
 - Uses `serde_json` to parse provider JSON.
-- Extracts video details and stream URLs from `streamingData`.
+- Extracts video details and direct stream URLs from `streamingData`.
+- Does not run local YouTube signature decipher logic.
 
 ## Evidence
 
-- `cargo test --offline` passed with YouTube parser and route fixture coverage.
+- `cargo test --offline` passed with YouTube InnerTube parser and route fixture
+  coverage.

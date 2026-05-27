@@ -11,7 +11,9 @@ use reqwest::Client;
 
 pub use facebook::parse_facebook;
 pub use tiktok::parse_tiktok;
-pub use youtube::parse_youtube;
+use youtube::fetch_youtube;
+#[cfg(test)]
+use youtube::parse_youtube_player_response;
 
 use crate::model::VideoInfo;
 
@@ -31,7 +33,7 @@ impl ExtractError {
             Self::UnsupportedUrl => {
                 "unsupported url; expected YouTube, TikTok, or Facebook".to_string()
             }
-            Self::FetchFailed(error) => format!("failed to fetch source html: {error}"),
+            Self::FetchFailed(error) => format!("failed to fetch provider data: {error}"),
             Self::MissingJson(name) => format!("could not find {name} json in html"),
             Self::InvalidJson(error) => format!("invalid provider json: {error}"),
             Self::MissingField(field) => format!("missing provider field: {field}"),
@@ -90,12 +92,37 @@ impl Extractor {
         cookie: Option<&str>,
     ) -> Result<VideoInfo, ExtractError> {
         let provider = provider_for_url(source_url).ok_or(ExtractError::UnsupportedUrl)?;
-        let html = self.fetch_html(source_url, cookie).await?;
 
         match provider {
-            Provider::YouTube => parse_youtube(source_url, &html),
-            Provider::TikTok => parse_tiktok(source_url, &html),
-            Provider::Facebook => parse_facebook(source_url, &html),
+            Provider::YouTube => self.fetch_youtube(source_url, cookie).await,
+            Provider::TikTok => {
+                let html = self.fetch_html(source_url, cookie).await?;
+                parse_tiktok(source_url, &html)
+            }
+            Provider::Facebook => {
+                let html = self.fetch_html(source_url, cookie).await?;
+                parse_facebook(source_url, &html)
+            }
+        }
+    }
+
+    async fn fetch_youtube(
+        &self,
+        source_url: &str,
+        cookie: Option<&str>,
+    ) -> Result<VideoInfo, ExtractError> {
+        match &self.fetcher {
+            HtmlFetcher::Live(client) => fetch_youtube(client, source_url, cookie).await,
+            #[cfg(test)]
+            HtmlFetcher::Fixture(fixtures) => {
+                let body = fixtures
+                    .get(source_url)
+                    .ok_or_else(|| ExtractError::FetchFailed("fixture not found".to_string()))?;
+                let response = serde_json::from_str(body)
+                    .map_err(|error| ExtractError::InvalidJson(error.to_string()))?;
+
+                parse_youtube_player_response(source_url, &response)
+            }
         }
     }
 

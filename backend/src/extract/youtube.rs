@@ -1,19 +1,66 @@
-use regex::Regex;
-use serde_json::Value;
+use reqwest::Client;
+use serde_json::{json, Value};
 
 use crate::model::{Platform, StreamInfo, VideoInfo};
 
-use super::{
-    collect_string, collect_u64, extract_json_object_after, last_thumbnail_url, query_param,
-    ExtractError,
-};
+use super::{collect_string, collect_u64, last_thumbnail_url, query_param, ExtractError};
 
-pub fn parse_youtube(source_url: &str, html: &str) -> Result<VideoInfo, ExtractError> {
-    let response = parse_player_response(html)?;
+const INNERTUBE_PLAYER_ENDPOINT: &str = "https://www.youtube.com/youtubei/v1/player";
+const ANDROID_CLIENT_NAME: &str = "ANDROID";
+const ANDROID_CLIENT_VERSION: &str = "20.10.38";
+const ANDROID_CLIENT_ID: &str = "3";
+const ANDROID_SDK_VERSION: u32 = 35;
+const ANDROID_USER_AGENT: &str = "com.google.android.youtube/20.10.38 (Linux; U; Android 14)";
+
+pub async fn fetch_youtube(
+    client: &Client,
+    source_url: &str,
+    cookie: Option<&str>,
+) -> Result<VideoInfo, ExtractError> {
+    let video_id = video_id_from_url(source_url).ok_or(ExtractError::MissingField("videoId"))?;
+    let payload = player_payload(&video_id);
+    let mut request = client
+        .post(INNERTUBE_PLAYER_ENDPOINT)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::USER_AGENT, ANDROID_USER_AGENT)
+        .header("x-youtube-client-name", ANDROID_CLIENT_ID)
+        .header("x-youtube-client-version", ANDROID_CLIENT_VERSION)
+        .json(&payload);
+
+    if let Some(cookie) = clean_cookie(cookie) {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ExtractError::FetchFailed(error.to_string()))?;
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(ExtractError::FetchFailed(format!(
+            "YouTube InnerTube player returned status {status}"
+        )));
+    }
+
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|error| ExtractError::InvalidJson(error.to_string()))?;
+
+    parse_youtube_player_response(source_url, &body)
+}
+
+pub fn parse_youtube_player_response(
+    source_url: &str,
+    response: &Value,
+) -> Result<VideoInfo, ExtractError> {
+    reject_unplayable(response)?;
+
     let details = response
         .get("videoDetails")
         .ok_or(ExtractError::MissingField("videoDetails"))?;
-    let streams = parse_streams(&response)?;
+    let streams = parse_streams(response)?;
 
     if streams.is_empty() {
         return Err(ExtractError::NoStreams);
@@ -22,7 +69,7 @@ pub fn parse_youtube(source_url: &str, html: &str) -> Result<VideoInfo, ExtractE
     Ok(VideoInfo {
         platform: Platform::YouTube,
         source_url: source_url.to_string(),
-        id: collect_string(details, &["videoId"]),
+        id: collect_string(details, &["videoId"]).or_else(|| video_id_from_url(source_url)),
         title: collect_string(details, &["title"]),
         author: collect_string(details, &["author"]),
         duration_seconds: collect_u64(details, &["lengthSeconds"]),
@@ -31,16 +78,91 @@ pub fn parse_youtube(source_url: &str, html: &str) -> Result<VideoInfo, ExtractE
     })
 }
 
-fn parse_player_response(html: &str) -> Result<Value, ExtractError> {
-    let marker = Regex::new(r#"ytInitialPlayerResponse\s*="#).unwrap();
-    let start = marker
-        .find(html)
-        .map(|match_| match_.end())
-        .ok_or(ExtractError::MissingJson("ytInitialPlayerResponse"))?;
-    let json = extract_json_object_after(html, start)
-        .ok_or(ExtractError::MissingJson("ytInitialPlayerResponse"))?;
+pub fn video_id_from_url(source_url: &str) -> Option<String> {
+    let without_scheme = source_url
+        .strip_prefix("https://")
+        .or_else(|| source_url.strip_prefix("http://"))?;
+    let (authority, remainder) = without_scheme
+        .split_once('/')
+        .map_or((without_scheme, ""), |(authority, path)| (authority, path));
+    let host = authority
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?
+        .to_ascii_lowercase();
+    let path = remainder.split(['?', '#']).next().unwrap_or("");
+    let query = source_url
+        .split_once('?')
+        .map(|(_, query)| query.split('#').next().unwrap_or(query));
 
-    serde_json::from_str(json).map_err(|error| ExtractError::InvalidJson(error.to_string()))
+    if host == "youtu.be" {
+        return path
+            .split('/')
+            .next()
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned);
+    }
+
+    if host == "youtube.com" || host.ends_with(".youtube.com") {
+        if let Some(video_id) = query.and_then(|query| query_param(query, "v")) {
+            if !video_id.is_empty() {
+                return Some(video_id);
+            }
+        }
+
+        for prefix in ["shorts/", "embed/", "live/"] {
+            if let Some(id) = path.strip_prefix(prefix) {
+                return id
+                    .split('/')
+                    .next()
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned);
+            }
+        }
+    }
+
+    None
+}
+
+fn player_payload(video_id: &str) -> Value {
+    json!({
+        "videoId": video_id,
+        "context": {
+            "client": {
+                "clientName": ANDROID_CLIENT_NAME,
+                "clientVersion": ANDROID_CLIENT_VERSION,
+                "androidSdkVersion": ANDROID_SDK_VERSION,
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    })
+}
+
+fn reject_unplayable(response: &Value) -> Result<(), ExtractError> {
+    let Some(playability) = response.get("playabilityStatus") else {
+        return Ok(());
+    };
+    let status = playability
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("UNKNOWN");
+
+    if status == "OK" {
+        return Ok(());
+    }
+
+    let reason = playability
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("no reason provided");
+
+    Err(ExtractError::FetchFailed(format!(
+        "YouTube video is not playable through InnerTube ({status}): {reason}"
+    )))
 }
 
 fn parse_streams(response: &Value) -> Result<Vec<StreamInfo>, ExtractError> {
@@ -66,16 +188,7 @@ fn parse_streams(response: &Value) -> Result<Vec<StreamInfo>, ExtractError> {
 }
 
 fn parse_stream(item: &Value) -> Option<StreamInfo> {
-    let url = item
-        .get("signatureCipher")
-        .or_else(|| item.get("cipher"))
-        .and_then(|value| value.as_str())
-        .and_then(signed_cipher_url)
-        .or_else(|| {
-            item.get("url")
-                .and_then(|value| value.as_str())
-                .map(ToOwned::to_owned)
-        })?;
+    let url = item.get("url").and_then(|value| value.as_str())?;
     let mime_type = item
         .get("mimeType")
         .and_then(|value| value.as_str())
@@ -90,14 +203,14 @@ fn parse_stream(item: &Value) -> Option<StreamInfo> {
         .and_then(|value| u32::try_from(value).ok());
     let has_video = mime_type
         .as_deref()
-        .is_none_or(|mime| mime.starts_with("video/"));
+        .is_some_and(|mime| mime.starts_with("video/"));
     let has_audio = item.get("audioQuality").is_some()
         || mime_type
             .as_deref()
             .is_some_and(|mime| mime.starts_with("audio/"));
 
     Some(StreamInfo {
-        url,
+        url: url.to_string(),
         mime_type,
         quality: item
             .get("qualityLabel")
@@ -113,120 +226,63 @@ fn parse_stream(item: &Value) -> Option<StreamInfo> {
     })
 }
 
-fn signed_cipher_url(cipher: &str) -> Option<String> {
-    let mut url = query_param(cipher, "url")?;
-    let signature = query_param(cipher, "s")?;
-    let signature_param = query_param(cipher, "sp").unwrap_or_else(|| "signature".to_string());
-    let signature = decipher_signature(&signature);
-    let separator = if url.contains('?') { '&' } else { '?' };
-
-    url.push(separator);
-    url.push_str("alr=yes&");
-    url.push_str(&signature_param);
-    url.push('=');
-    url.push_str(&percent_encode_component(&signature));
-
-    Some(url)
-}
-
-fn decipher_signature(signature: &str) -> String {
-    if signature.len() < 20 {
-        return signature.to_string();
-    }
-
-    let mut chars: Vec<char> = signature.chars().collect();
-
-    chars.pop();
-    swap(&mut chars, 18);
-    swap(&mut chars, 68);
-    swap(&mut chars, 20);
-    swap(&mut chars, 82);
-    chars.pop();
-    swap(&mut chars, 64);
-    chars.pop();
-
-    if !chars.is_empty() {
-        chars.remove(0);
-    }
-
-    chars.into_iter().collect()
-}
-
-fn swap(chars: &mut [char], index: usize) {
-    if chars.is_empty() {
-        return;
-    }
-
-    let target = index % chars.len();
-    chars.swap(0, target);
-}
-
-fn percent_encode_component(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char);
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-
-    encoded
+fn clean_cookie(cookie: Option<&str>) -> Option<&str> {
+    cookie.map(str::trim).filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const YOUTUBE_HTML: &str = r#"
-        <html>
-          <script>
-            var ytInitialPlayerResponse = {
-              "videoDetails": {
-                "videoId": "abc123",
-                "title": "Fixture YouTube Video",
-                "author": "Fixture Channel",
-                "lengthSeconds": "61",
-                "thumbnail": {
-                  "thumbnails": [
-                    {"url": "https://img.example/small.jpg"},
-                    {"url": "https://img.example/large.jpg"}
-                  ]
-                }
-              },
-              "streamingData": {
-                "formats": [
-                  {
-                    "url": "https://video.example/itag18.mp4",
-                    "mimeType": "video/mp4",
-                    "qualityLabel": "360p",
-                    "width": 640,
-                    "height": 360,
-                    "bitrate": 400000,
-                    "audioQuality": "AUDIO_QUALITY_MEDIUM"
-                  }
-                ],
-                "adaptiveFormats": [
-                  {
-                    "signatureCipher": "url=https%3A%2F%2Fvideo.example%2Fitag137.mp4%3Fitag%3D137&sp=sig&s=abc",
-                    "mimeType": "video/mp4",
-                    "qualityLabel": "1080p",
-                    "width": 1920,
-                    "height": 1080,
-                    "bitrate": 2500000
-                  }
-                ]
+    pub const YOUTUBE_PLAYER_RESPONSE: &str = r#"
+        {
+          "playabilityStatus": {
+            "status": "OK"
+          },
+          "videoDetails": {
+            "videoId": "abc123",
+            "title": "Fixture YouTube Video",
+            "author": "Fixture Channel",
+            "lengthSeconds": "61",
+            "thumbnail": {
+              "thumbnails": [
+                {"url": "https://img.example/small.jpg"},
+                {"url": "https://img.example/large.jpg"}
+              ]
+            }
+          },
+          "streamingData": {
+            "formats": [
+              {
+                "url": "https://video.example/itag18.mp4",
+                "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+                "qualityLabel": "360p",
+                "width": 640,
+                "height": 360,
+                "bitrate": 400000,
+                "audioQuality": "AUDIO_QUALITY_MEDIUM"
               }
-            };
-          </script>
-        </html>
+            ],
+            "adaptiveFormats": [
+              {
+                "url": "https://video.example/itag137.mp4",
+                "mimeType": "video/mp4; codecs=\"avc1.640028\"",
+                "qualityLabel": "1080p",
+                "width": 1920,
+                "height": 1080,
+                "bitrate": 2500000
+              }
+            ]
+          }
+        }
     "#;
 
     #[test]
     fn parses_youtube_player_response() {
-        let video = parse_youtube("https://www.youtube.com/watch?v=abc123", YOUTUBE_HTML).unwrap();
+        let response: Value = serde_json::from_str(YOUTUBE_PLAYER_RESPONSE).unwrap();
+        let video =
+            parse_youtube_player_response("https://www.youtube.com/watch?v=abc123", &response)
+                .unwrap();
 
         assert_eq!(video.platform, Platform::YouTube);
         assert_eq!(video.id.as_deref(), Some("abc123"));
@@ -239,10 +295,25 @@ mod tests {
         );
         assert_eq!(video.streams.len(), 2);
         assert_eq!(video.streams[0].quality.as_deref(), Some("360p"));
+        assert_eq!(video.streams[0].has_audio, true);
+        assert_eq!(video.streams[0].has_video, true);
         assert_eq!(video.streams[1].quality.as_deref(), Some("1080p"));
+        assert_eq!(video.streams[1].url, "https://video.example/itag137.mp4");
+    }
+
+    #[test]
+    fn extracts_video_id_from_supported_urls() {
         assert_eq!(
-            video.streams[1].url,
-            "https://video.example/itag137.mp4?itag=137&alr=yes&sig=abc"
+            video_id_from_url("https://www.youtube.com/watch?v=abc123&t=1"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            video_id_from_url("https://youtu.be/abc123?si=demo"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            video_id_from_url("https://www.youtube.com/shorts/abc123"),
+            Some("abc123".to_string())
         );
     }
 }

@@ -376,33 +376,32 @@ mod tests {
 
     fn youtube_fixture() -> &'static str {
         r#"
-            <html>
-              <script>
-                var ytInitialPlayerResponse = {
-                  "videoDetails": {
-                    "videoId": "abc123",
-                    "title": "Fixture YouTube Video",
-                    "author": "Fixture Channel",
-                    "lengthSeconds": "61",
-                    "thumbnail": {
-                      "thumbnails": [{"url": "https://img.example/large.jpg"}]
-                    }
-                  },
-                  "streamingData": {
-                    "formats": [
-                      {
-                        "url": "https://video.example/itag18.mp4",
-                        "mimeType": "video/mp4",
-                        "qualityLabel": "360p",
-                        "width": 640,
-                        "height": 360,
-                        "audioQuality": "AUDIO_QUALITY_MEDIUM"
-                      }
-                    ]
+            {
+              "playabilityStatus": {
+                "status": "OK"
+              },
+              "videoDetails": {
+                "videoId": "abc123",
+                "title": "Fixture YouTube Video",
+                "author": "Fixture Channel",
+                "lengthSeconds": "61",
+                "thumbnail": {
+                  "thumbnails": [{"url": "https://img.example/large.jpg"}]
+                }
+              },
+              "streamingData": {
+                "formats": [
+                  {
+                    "url": "https://video.example/itag18.mp4",
+                    "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+                    "qualityLabel": "360p",
+                    "width": 640,
+                    "height": 360,
+                    "audioQuality": "AUDIO_QUALITY_MEDIUM"
                   }
-                };
-              </script>
-            </html>
+                ]
+              }
+            }
         "#
     }
 

@@ -1,133 +1,72 @@
 # Architecture
 
-No application stack is selected yet.
+This document describes the design, stack choices, and codebase structure of the Video Downloader project.
 
-No application code exists yet. This document defines generic architecture
-questions and boundary rules that future implementation should adapt after a
-user-provided spec and stack decision exist.
+## Runtime Surfaces & Stack
 
-## Discovery Before Shape
+The application is structured as a decoupled full-stack application:
 
-Before proposing implementation shape, identify:
-
-- Product surfaces: browser, mobile, desktop, CLI, API, worker, or service.
-- Runtime stack: language, framework, database, queues, providers, and hosting.
-- Core domains: the product concepts that deserve stable names and contracts.
-- Boundary inputs: user input, API requests, webhooks, jobs, files, credentials,
-  provider payloads, and environment configuration.
-- Validation ladder: the smallest checks that can prove the selected stack.
-
-Record stack choices in `docs/decisions/` when they meaningfully constrain
-future work.
-
-## Default Layering
+| Surface | Path | Technology Stack | Purpose |
+| --- | --- | --- | --- |
+| **Frontend** | `frontend/` | Next.js (App Router), React, TypeScript, TailwindCSS/Vanilla CSS | User interface, video selection grid, file save trigger |
+| **Backend** | `backend/` | Rust, Axum, Tokio, Reqwest, Serde | Extractor and playlist crawler API, concurrent media downloader, streaming ZIP archiver |
 
 ```text
-domain
-  <- application
-      <- infrastructure
-          <- interface
-              <- app surfaces
++-----------------------+                    +------------------------+
+|  Next.js Frontend     |                    |  Rust Axum Backend     |
+|                       |                    |                        |
+|  [ Video Input Form ] |                    |  [ GET /api/extract ]  |
+|                       |  HTTP GET/POST     |  [ GET /api/channel ]  |
+|  [ Video Grid /     ] | -----------------> |                        |
+|  [ Selection State  ] |                    |  [ POST /download ]    |
+|                       | <----------------- |  - Tokio tasks         |
+|  [ ZIP Downloader   ] |   ZIP Stream / JSON|  - zip-writer stream   |
++-----------------------+                    +------------------------+
 ```
 
-## Candidate Structure
+---
 
-```text
-app/
-  domain/
-    entities/
-    value-objects/
-    repositories/
-    services/
+## Codebase Layout
 
-  application/
-    commands/
-    queries/
-    handlers/
+### Backend Structure (`backend/src/`)
 
-  infrastructure/
-    database/
-    logging/
-    notifications/
+The backend is built around independent modules coordinated via Axum routing and shared state:
 
-  interface/
-    controllers/
-    dto/
-    presenters/
-    routes/
-    middlewares/
+- [main.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/main.rs): Configures CORS, sets up Axum router and shared `AppState`, handles logging, and wires requests to endpoints.
+- [model.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/model.rs): Holds the core domain models (`VideoInfo`, `StreamInfo`, and `ChannelVideo`) used for type safety and serialization across the boundary.
+- [bulk.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/bulk.rs): Manages concurrent download worker tasks using Tokio green threads. It retrieves raw streams and streams ZIP archive bytes back through a memory channel directly to the Axum HTTP response.
+- [extract/](file:///media/hzjnauary/Workspace/videodownloader/backend/src/extract/mod.rs): Extraction engines for single video URLs.
+  - [youtube.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/extract/youtube.rs): Calls the YouTube InnerTube API (`/youtubei/v1/player`) via JSON POST using the `ANDROID` client context to obtain un-deciphered stream URLs.
+  - [tiktok.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/extract/tiktok.rs): Parses `SIGI_STATE` or `__NEXT_DATA__` from video HTML.
+  - [facebook.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/extract/facebook.rs): Scrapes page source for high/standard-definition direct MP4 links (`playable_url`, `playable_url_quality_hd`, etc.).
+- [channel/](file:///media/hzjnauary/Workspace/videodownloader/backend/src/channel/mod.rs): Scrapers and collection crawlers. Implements pagination, cursor forwarding, continuation tokens, and raw HTML scraping for YouTube channel/playlist, TikTok profile, and Facebook page/profile videos.
 
-surfaces/
-  browser/
-  mobile/
-  desktop/
-  cli/
-```
+### Frontend Structure (`frontend/`)
 
-This is a thinking template, not a scaffold. Create real folders only when a
-story enters implementation and the selected stack needs them.
+- [frontend/app/](file:///media/hzjnauary/Workspace/videodownloader/frontend/app/): Next.js App Router directory. The user interface uses native React hooks for stateful selection management, optional browser cookie input fields, and supports concurrent download streams.
 
-## Dependency Rule
+---
 
-Inner layers must not depend on outer layers.
+## Architectural Principles & Boundary Rules
 
-| Layer | May depend on | Must not depend on |
-| --- | --- | --- |
-| domain | nothing project-external except tiny pure utilities | framework, database, UI, provider, process/env |
-| application | domain | framework, UI, provider, database concrete clients |
-| infrastructure | domain, application | interface controllers or UI |
-| interface | all backend layers | UI state or platform shell assumptions |
-| app surfaces | API contracts and app-facing clients | domain internals directly |
+### 1. Parse-First Boundary Rule
 
-## Parse-First Boundary Rule
+Raw string inputs, queries, and payload parameters must be validated and parsed at the API boundary before entering core processing modules.
 
-Unknown data must be parsed at boundaries before it enters inner code.
+- API handlers parse incoming query arguments into strongly-typed parameters.
+- Platform hosts are evaluated against explicit string patterns to reject unsupported URL formats early with a `400 Bad Request` status.
 
-Boundaries include:
+### 2. Stateless Forwarded Credentials
 
-- HTTP request bodies, params, and query strings.
-- Session payloads and identity claims.
-- Environment variables.
-- Database rows returned from external clients.
-- Platform shell payloads.
-- Deep links, tokens, and signed URLs.
-- Provider webhooks, events, and async payloads.
+Authentication barriers on platforms like Facebook and TikTok are bypassed by allowing users to supply an optional provider cookie (`cookie` field).
 
-Target flow:
+- The cookie is forwarded in the request headers of outgoing HTTP calls to upstream platforms.
+- The server is completely stateless and does not persist or cache these cookies.
 
-```text
-unknown input
-  -> parser
-  -> typed DTO or command
-  -> application use case
-  -> domain object/value object
-```
+### 3. ZIP Streaming (No Disk Buffer)
 
-Inner layers should work with meaningful product types such as `UserId`,
-`AccountId`, `WorkspaceId`, `Role`, `DateRange`, or domain-specific IDs,
-rather than repeatedly validating raw strings.
+To keep memory consumption low and allow bulk downloading of large files, the backend streams the ZIP archive on the fly:
 
-## Command/Query Boundary
-
-If the product has both reads and writes, keep command/query separation clear at
-the code level even when the storage layer is simple:
-
-- Commands mutate state and own audit side effects.
-- Queries read state and format for consumers.
-- Shared domain rules live in domain/application, not controllers.
-
-## Observability Contract
-
-The future server should emit one canonical JSON log line per request with:
-
-- timestamp
-- level
-- request_id
-- user_id when known
-- action
-- duration_ms
-- status_code
-- message
-
-Audit logs are product records. Application logs are operational records. Do not
-use one as a substitute for the other.
+- Axum serves a chunked stream.
+- A Tokio worker downloads files concurrently.
+- Compressed bytes are written directly to the response writer, keeping disk usage zero.

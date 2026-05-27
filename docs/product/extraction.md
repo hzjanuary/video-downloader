@@ -49,10 +49,14 @@ in Rust without using `yt-dlp` or provider wrapper modules.
 
 ## Provider Parsing
 
-- YouTube: fetch HTML with `reqwest`, locate `ytInitialPlayerResponse` with
-  `regex`, extract the balanced JSON object, parse it with `serde_json`, and
-  read `videoDetails` plus `streamingData.formats` and
-  `streamingData.adaptiveFormats`.
+- YouTube: call the InnerTube player endpoint
+  `https://www.youtube.com/youtubei/v1/player` with an Android client context,
+  parse the JSON response with `serde_json`, and read `videoDetails` plus
+  direct stream URLs from `streamingData.formats` and
+  `streamingData.adaptiveFormats`. YouTube single-video extraction does not
+  parse `ytInitialPlayerResponse` from raw watch-page HTML and does not run a
+  local signature decipher routine. The backend pins a current working Android
+  client version for this request.
 - TikTok: fetch HTML with `reqwest`, locate `SIGI_STATE` or `__NEXT_DATA__`
   script JSON with `regex`, parse with `serde_json`, and read item/video fields.
   `playAddr` and bitrate `PlayAddr.UrlList` entries are treated as no-watermark
@@ -65,8 +69,8 @@ in Rust without using `yt-dlp` or provider wrapper modules.
 
 ## Validation
 
-Parser and route tests use controlled HTML fixtures for YouTube
-`ytInitialPlayerResponse`, TikTok `SIGI_STATE`, TikTok `__NEXT_DATA__`, and
-Facebook embedded MP4 fields / JSON-LD. Live provider HTML can change without
-notice, and Facebook often requires authenticated cookies, so deterministic
-fixture tests are the required proof for the first implementation slice.
+Parser and route tests use controlled InnerTube JSON fixtures for YouTube,
+HTML fixtures for TikTok `SIGI_STATE` / `__NEXT_DATA__`, and Facebook embedded
+MP4 fields / JSON-LD. Live provider behavior can change without notice, and
+Facebook often requires authenticated cookies, so deterministic fixture tests
+remain required proof.
