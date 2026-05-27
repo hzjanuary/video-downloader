@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     io,
+    net::{IpAddr, Ipv6Addr},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -11,7 +12,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Response};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -19,6 +20,8 @@ use crate::extract::Extractor;
 
 const OUTPUT_CHANNEL_BUFFER: usize = 8;
 const DOWNLOAD_CHANNEL_BUFFER: usize = 4;
+const MAX_BULK_IDS: usize = 500;
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
 
 #[derive(Debug, Deserialize)]
 pub struct BulkDownloadRequest {
@@ -31,13 +34,15 @@ pub struct BulkDownloadRequest {
 pub enum BulkDownloadError {
     EmptyIds,
     TooManyIds,
+    PrepareFailed(String),
 }
 
 impl BulkDownloadError {
-    pub fn message(&self) -> &'static str {
+    pub fn message(&self) -> String {
         match self {
-            Self::EmptyIds => "ids must contain at least one video id",
-            Self::TooManyIds => "ids must contain at most 100 video ids",
+            Self::EmptyIds => "ids must contain at least one video id".to_string(),
+            Self::TooManyIds => "ids must contain at most 500 video ids".to_string(),
+            Self::PrepareFailed(error) => error.clone(),
         }
     }
 }
@@ -88,9 +93,7 @@ impl Stream for ReceiverStream {
 impl BulkDownloader {
     pub fn live(extractor: Arc<Extractor>) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            client: Client::builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
-                .build()?,
+            client: Client::builder().user_agent(BROWSER_USER_AGENT).build()?,
             extractor,
             source: DownloadSource::Live,
         })
@@ -105,7 +108,7 @@ impl BulkDownloader {
         }
     }
 
-    pub fn download_zip(
+    pub async fn download_zip(
         &self,
         request: BulkDownloadRequest,
     ) -> Result<ReceiverStream, BulkDownloadError> {
@@ -115,11 +118,13 @@ impl BulkDownloader {
             return Err(BulkDownloadError::EmptyIds);
         }
 
-        if ids.len() > 100 {
+        if ids.len() > MAX_BULK_IDS {
             return Err(BulkDownloadError::TooManyIds);
         }
 
-        let entries = self.start_downloads(ids, request.source_url, request.cookie);
+        let entries = self
+            .start_downloads(ids, request.source_url, request.cookie)
+            .await?;
         let (sender, receiver) = mpsc::channel(OUTPUT_CHANNEL_BUFFER);
 
         tokio::spawn(async move {
@@ -131,98 +136,91 @@ impl BulkDownloader {
         Ok(ReceiverStream { receiver })
     }
 
-    fn start_downloads(
+    async fn start_downloads(
         &self,
         ids: Vec<String>,
         source_url: Option<String>,
         cookie: Option<String>,
-    ) -> Vec<DownloadEntry> {
-        ids.into_iter()
-            .map(|id| {
-                let (sender, receiver) = mpsc::channel(DOWNLOAD_CHANNEL_BUFFER);
-                let filename = format!("{}.bin", safe_filename(&id));
+    ) -> Result<Vec<DownloadEntry>, BulkDownloadError> {
+        let mut entries = Vec::with_capacity(ids.len());
 
-                match &self.source {
-                    DownloadSource::Live => {
-                        let client = self.client.clone();
-                        let extractor = self.extractor.clone();
-                        let source_url = source_url.clone();
-                        let cookie = cookie.clone();
-                        let download_id = id.clone();
+        for id in ids {
+            let (sender, receiver) = mpsc::channel(DOWNLOAD_CHANNEL_BUFFER);
+            let filename = format!("{}.bin", safe_filename(&id));
 
-                        tokio::spawn(async move {
-                            download_live_id(
-                                client,
-                                extractor,
-                                source_url,
-                                cookie,
-                                download_id,
-                                sender,
-                            )
-                            .await;
-                        });
-                    }
-                    #[cfg(test)]
-                    DownloadSource::Fixture(fixtures) => {
-                        let bytes = fixtures.get(&id).cloned();
-                        let missing_id = id.clone();
+            match &self.source {
+                DownloadSource::Live => {
+                    let client = self.client.clone();
+                    let extractor = self.extractor.clone();
+                    let source_url = source_url.clone();
+                    let cookie = cookie.clone();
+                    let download_id = id.clone();
+                    let download_url = resolve_download_url(
+                        extractor.clone(),
+                        source_url.as_deref(),
+                        cookie.as_deref(),
+                        &download_id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        BulkDownloadError::PrepareFailed(format!(
+                            "failed to prepare {download_id}: {error}"
+                        ))
+                    })?;
+                    let response = open_download_response(
+                        &client,
+                        cookie.as_deref(),
+                        &download_url,
+                        &download_id,
+                    )
+                    .await
+                    .map_err(BulkDownloadError::PrepareFailed)?;
 
-                        tokio::spawn(async move {
-                            match bytes {
-                                Some(bytes) => {
-                                    for chunk in bytes.chunks(8) {
-                                        if sender
-                                            .send(Ok(Bytes::copy_from_slice(chunk)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
+                    tokio::spawn(async move {
+                        stream_live_response(response, sender).await;
+                    });
+                }
+                #[cfg(test)]
+                DownloadSource::Fixture(fixtures) => {
+                    let bytes = fixtures.get(&id).cloned();
+                    let missing_id = id.clone();
+
+                    tokio::spawn(async move {
+                        match bytes {
+                            Some(bytes) => {
+                                for chunk in bytes.chunks(8) {
+                                    if sender
+                                        .send(Ok(Bytes::copy_from_slice(chunk)))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
                                     }
                                 }
-                                None => {
-                                    let _ = sender
-                                        .send(Err(format!("fixture not found for id {missing_id}")))
-                                        .await;
-                                }
                             }
-                        });
-                    }
+                            None => {
+                                let _ = sender
+                                    .send(Err(format!("fixture not found for id {missing_id}")))
+                                    .await;
+                            }
+                        }
+                    });
                 }
+            }
 
-                DownloadEntry {
-                    id,
-                    filename,
-                    receiver,
-                }
-            })
-            .collect()
+            entries.push(DownloadEntry {
+                id,
+                filename,
+                receiver,
+            });
+        }
+
+        Ok(entries)
     }
 }
 
-async fn download_live_id(
-    client: Client,
-    extractor: Arc<Extractor>,
-    source_url: Option<String>,
-    cookie: Option<String>,
-    id: String,
-    sender: mpsc::Sender<Result<Bytes, String>>,
-) {
+async fn stream_live_response(response: Response, sender: mpsc::Sender<Result<Bytes, String>>) {
     let result = async {
-        let download_url =
-            resolve_download_url(extractor, source_url.as_deref(), cookie.as_deref(), &id).await?;
-        let mut request = client.get(&download_url);
-
-        if let Some(cookie) = clean_cookie(cookie.as_deref()) {
-            request = request.header(reqwest::header::COOKIE, cookie);
-        }
-
-        let response = request.send().await.map_err(|error| error.to_string())?;
-
-        if !response.status().is_success() {
-            return Err(format!("download source returned {}", response.status()));
-        }
-
         let mut stream = response.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
@@ -282,6 +280,67 @@ async fn resolve_download_url(
         .ok_or_else(|| "no downloadable stream found".to_string())?;
 
     Ok(stream.url.clone())
+}
+
+async fn open_download_response(
+    client: &Client,
+    cookie: Option<&str>,
+    download_url: &str,
+    id: &str,
+) -> Result<Response, String> {
+    let media_client = if is_googlevideo_ipv6_url(download_url) {
+        Client::builder()
+            .user_agent(BROWSER_USER_AGENT)
+            .local_address(IpAddr::V6(Ipv6Addr::UNSPECIFIED))
+            .build()
+            .unwrap_or_else(|_| client.clone())
+    } else {
+        client.clone()
+    };
+    let mut request = provider_download_headers(media_client.get(download_url), download_url);
+
+    if let Some(cookie) = clean_cookie(cookie) {
+        request = request.header(reqwest::header::COOKIE, cookie);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("failed to reach download host for {id}: {error}"))?;
+
+    if !response.status().is_success() {
+        Err(format!(
+            "download source for {id} returned {}",
+            response.status()
+        ))
+    } else {
+        Ok(response)
+    }
+}
+
+fn is_googlevideo_ipv6_url(download_url: &str) -> bool {
+    download_url.contains("googlevideo.com")
+        && download_url.contains("ip=")
+        && download_url.contains("%3A")
+}
+
+fn provider_download_headers(request: RequestBuilder, download_url: &str) -> RequestBuilder {
+    if download_url.contains("googlevideo.com") {
+        return request
+            .header(reqwest::header::ACCEPT, "*/*")
+            .header(reqwest::header::REFERER, "https://www.youtube.com/");
+    }
+
+    if download_url.contains("tiktokcdn")
+        || download_url.contains("tiktokv")
+        || download_url.contains("byteoversea")
+    {
+        return request
+            .header(reqwest::header::ACCEPT, "*/*")
+            .header(reqwest::header::REFERER, "https://www.tiktok.com/");
+    }
+
+    request
 }
 
 async fn write_zip_stream(
@@ -551,6 +610,7 @@ pub(crate) mod tests {
                 cookie: None,
                 ids: vec!["alpha".to_string(), "beta".to_string()],
             })
+            .await
             .unwrap();
         let bytes = collect_stream(stream).await;
         let entries = read_stored_zip(&bytes);

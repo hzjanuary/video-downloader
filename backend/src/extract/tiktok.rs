@@ -54,6 +54,11 @@ fn parse_state_json(html: &str) -> Result<Value, ExtractError> {
             .map_err(|error| ExtractError::InvalidJson(error.to_string()));
     }
 
+    if let Some(json) = script_json_by_id(html, "__UNIVERSAL_DATA_FOR_REHYDRATION__") {
+        return serde_json::from_str(json)
+            .map_err(|error| ExtractError::InvalidJson(error.to_string()));
+    }
+
     let marker = Regex::new(r#"SIGI_STATE"#).unwrap();
     if let Some(match_) = marker.find(html) {
         if let Some(json) = extract_json_object_after(html, match_.end()) {
@@ -62,7 +67,9 @@ fn parse_state_json(html: &str) -> Result<Value, ExtractError> {
         }
     }
 
-    Err(ExtractError::MissingJson("SIGI_STATE or __NEXT_DATA__"))
+    Err(ExtractError::MissingJson(
+        "SIGI_STATE, __NEXT_DATA__, or __UNIVERSAL_DATA_FOR_REHYDRATION__",
+    ))
 }
 
 fn script_json_by_id<'a>(html: &'a str, id: &str) -> Option<&'a str> {

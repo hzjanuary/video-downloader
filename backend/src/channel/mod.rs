@@ -72,6 +72,7 @@ struct TikTokCursor {
     sec_uid: Option<String>,
     cursor: String,
     referer: Option<String>,
+    cookie: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,7 +131,7 @@ impl ChannelFetcher {
     ) -> Result<Vec<ChannelVideo>, ChannelError> {
         match provider_for_url(source_url).ok_or(ChannelError::UnsupportedUrl)? {
             Provider::YouTube => self.fetch_youtube_channel(source_url).await,
-            Provider::TikTok => self.fetch_tiktok_profile(source_url).await,
+            Provider::TikTok => self.fetch_tiktok_profile(source_url, cookie).await,
             Provider::Facebook => self.fetch_facebook_collection(source_url, cookie).await,
         }
     }
@@ -189,8 +190,9 @@ impl ChannelFetcher {
     async fn fetch_tiktok_profile(
         &self,
         source_url: &str,
+        cookie: Option<&str>,
     ) -> Result<Vec<ChannelVideo>, ChannelError> {
-        let html = self.fetch_get(source_url).await?;
+        let html = self.fetch_get_with_cookie(source_url, cookie).await?;
         let initial_json = parse_tiktok_state(&html)?;
         let initial_page = parse_tiktok_page(&initial_json);
         let initial_video_count = initial_page.videos.len();
@@ -216,6 +218,7 @@ impl ChannelFetcher {
             sec_uid: initial_sec_uid,
             cursor,
             referer: Some(source_url.to_string()),
+            cookie: cookie.map(ToOwned::to_owned),
         });
         let mut seen_cursors = HashSet::new();
         let mut pages = 1usize;
@@ -240,6 +243,7 @@ impl ChannelFetcher {
                     sec_uid: parsed.sec_uid.or_else(|| request.sec_uid.clone()),
                     cursor: next,
                     referer: request.referer.clone(),
+                    cookie: request.cookie.clone(),
                 });
             pages += 1;
         }
@@ -469,10 +473,23 @@ impl ChannelFetcher {
                     .sec_uid
                     .as_deref()
                     .ok_or(ChannelError::MissingField("secUid"))?;
-                let endpoint = format!(
-                    "https://www.tiktok.com/api/post/item_list/?aid=1988&app_language=en&app_name=tiktok_web&browser_language=en-US&browser_name=Mozilla&browser_online=true&browser_platform=Win32&browser_version=5.0&channel=tiktok_web&count=35&cursor={}&device_platform=web_pc&focus_state=true&from_page=user&history_len=2&is_fullscreen=false&is_page_visible=true&language=en&region=US&screen_height=1080&screen_width=1920&secUid={}&tz_name=UTC&user_is_login=false&webcast_language=en",
-                    request.cursor, sec_uid
-                );
+                let verify_fp = request
+                    .cookie
+                    .as_deref()
+                    .and_then(|cookie| cookie_value(cookie, "s_v_web_id"));
+                let endpoint = if let Some(verify_fp) = verify_fp.as_deref() {
+                    format!(
+                        "https://m.tiktok.com/api/post/item_list/?aid=1988&cookie_enabled=true&count=35&verifyFp={}&secUid={}&cursor={}",
+                        percent_encode(verify_fp),
+                        sec_uid,
+                        request.cursor
+                    )
+                } else {
+                    format!(
+                        "https://www.tiktok.com/api/post/item_list/?aid=1988&app_language=en&app_name=tiktok_web&browser_language=en-US&browser_name=Mozilla&browser_online=true&browser_platform=Win32&browser_version=5.0&channel=tiktok_web&count=35&cursor={}&device_platform=web_pc&focus_state=true&from_page=user&history_len=2&is_fullscreen=false&is_page_visible=true&language=en&region=US&screen_height=1080&screen_width=1920&secUid={}&tz_name=UTC&user_is_login=false&webcast_language=en",
+                        request.cursor, sec_uid
+                    )
+                };
                 let mut last_error = None;
 
                 for attempt in 0..RETRIES {
@@ -485,14 +502,17 @@ impl ChannelFetcher {
                         .as_deref()
                         .unwrap_or("https://www.tiktok.com/");
 
-                    match client
+                    let mut builder = client
                         .get(&endpoint)
                         .header("accept", "application/json, text/plain, */*")
                         .header("accept-language", "en-US,en;q=0.9")
-                        .header("referer", referer)
-                        .send()
-                        .await
-                    {
+                        .header("referer", referer);
+
+                    if let Some(cookie) = clean_cookie(request.cookie.as_deref()) {
+                        builder = builder.header(reqwest::header::COOKIE, cookie);
+                    }
+
+                    match builder.send().await {
                         Ok(response) if response.status().is_success() => {
                             let text = response
                                 .text()
@@ -501,7 +521,7 @@ impl ChannelFetcher {
 
                             if text.trim().is_empty() {
                                 return Err(ChannelError::FetchFailed(
-                                    "TikTok returned an empty cursor response; profile feed API may require browser verification"
+                                    "TikTok returned an empty cursor response; paste a fresh TikTok browser cookie including s_v_web_id if the profile is verification-gated"
                                         .to_string(),
                                 ));
                             }
@@ -1316,6 +1336,13 @@ fn percent_encode(value: &str) -> String {
 
 fn clean_cookie(cookie: Option<&str>) -> Option<&str> {
     cookie.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.trim().to_string())
+    })
 }
 
 fn decode_html_entities(input: &str) -> String {

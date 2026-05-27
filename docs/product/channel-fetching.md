@@ -12,7 +12,9 @@ HTML exposes continuation data.
 - Route: `GET /api/channel?url={link}`
 - Optional query:
   - `cookie`: provider cookie string forwarded only to upstream fetches. This is
-    intended for local Facebook auth-wall bypass when public HTML is blocked.
+    intended for local auth-wall bypass when public HTML is blocked. TikTok
+    profile pagination can require a fresh browser cookie containing
+    `s_v_web_id`.
 - Response: JSON array.
 - Item shape:
 
@@ -52,7 +54,8 @@ Unsupported URLs return `400`.
   then follow `cursor`, `maxCursor`, or `max_cursor` while `hasMore` /
   `has_more` is true. When TikTok serves profile hydration with only
   `secUid` and an empty item list, the backend starts the profile feed cursor
-  at `0`.
+  at `0`. If the caller supplies a cookie with `s_v_web_id`, cursor pagination
+  uses TikTok's mobile feed endpoint with that verifier value.
 - Facebook: parse Page/Profile HTML for video IDs from `/watch/?v=...`,
   `/videos/...`, `/reel/...`, and embedded JSON objects typed as Video/Reel.
   Pagination follows visible next-page links when present, or embedded

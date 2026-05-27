@@ -11,6 +11,12 @@ type ChannelVideo = {
   thumbnail_url: string | null;
 };
 
+type VideoInfo = {
+  id: string | null;
+  title: string | null;
+  thumbnail_url: string | null;
+};
+
 type SaveFilePicker = (options: {
   suggestedName: string;
   types: Array<{
@@ -57,19 +63,15 @@ export default function Home() {
         params.set("cookie", cleanCookie);
       }
 
-      const response = await fetch(
-        `${normalizedApiBaseUrl}/api/channel?${params.toString()}`,
-      );
-
-      if (!response.ok) {
-        throw new Error(await readApiError(response));
-      }
-
-      const items = (await response.json()) as ChannelVideo[];
+      const items = isSingleVideoUrl(url)
+        ? await fetchSingleVideo(normalizedApiBaseUrl, params)
+        : await fetchChannelVideos(normalizedApiBaseUrl, params);
 
       setVideos(items);
       setSelectedIds(new Set(items.map((item) => item.id)));
-      setStatus(`Loaded ${items.length} videos.`);
+      setStatus(
+        items.length === 1 ? "Loaded 1 video." : `Loaded ${items.length} videos.`,
+      );
     } catch (error) {
       setVideos([]);
       setSelectedIds(new Set());
@@ -224,6 +226,75 @@ export default function Home() {
       </section>
     </main>
   );
+}
+
+async function fetchChannelVideos(apiBaseUrl: string, params: URLSearchParams) {
+  const response = await fetch(`${apiBaseUrl}/api/channel?${params.toString()}`);
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response));
+  }
+
+  return (await response.json()) as ChannelVideo[];
+}
+
+async function fetchSingleVideo(apiBaseUrl: string, params: URLSearchParams) {
+  const response = await fetch(`${apiBaseUrl}/api/extract?${params.toString()}`);
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response));
+  }
+
+  const video = (await response.json()) as VideoInfo;
+
+  if (!video.id) {
+    throw new Error("Could not find a video id in this URL.");
+  }
+
+  return [
+    {
+      id: video.id,
+      title: video.title,
+      thumbnail_url: video.thumbnail_url,
+    },
+  ];
+}
+
+function isSingleVideoUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    const path = url.pathname;
+
+    if (host === "youtu.be") {
+      return path.length > 1;
+    }
+
+    if (host === "youtube.com" || host.endsWith(".youtube.com")) {
+      return url.searchParams.has("v") || path.startsWith("/shorts/");
+    }
+
+    if (host === "tiktok.com" || host.endsWith(".tiktok.com")) {
+      return /\/@[^/]+\/video\/\d+/.test(path);
+    }
+
+    if (
+      host === "facebook.com" ||
+      host.endsWith(".facebook.com") ||
+      host === "fb.watch" ||
+      host.endsWith(".fb.watch")
+    ) {
+      return (
+        url.searchParams.has("v") ||
+        path.startsWith("/reel/") ||
+        /\/videos\/[^/]+/.test(path)
+      );
+    }
+  } catch {
+    return false;
+  }
+
+  return false;
 }
 
 async function readApiError(response: Response) {

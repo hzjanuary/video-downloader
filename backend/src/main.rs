@@ -100,9 +100,14 @@ impl From<ChannelError> for ApiError {
 
 impl From<BulkDownloadError> for ApiError {
     fn from(error: BulkDownloadError) -> Self {
+        let status = match error {
+            BulkDownloadError::EmptyIds | BulkDownloadError::TooManyIds => StatusCode::BAD_REQUEST,
+            BulkDownloadError::PrepareFailed(_) => StatusCode::BAD_GATEWAY,
+        };
+
         Self {
-            status: StatusCode::BAD_REQUEST,
-            message: error.message().to_string(),
+            status,
+            message: error.message(),
         }
     }
 }
@@ -168,7 +173,7 @@ async fn download_bulk(
     State(state): State<AppState>,
     Json(request): Json<BulkDownloadRequest>,
 ) -> Result<Response, ApiError> {
-    let stream = state.bulk_downloader.download_zip(request)?;
+    let stream = state.bulk_downloader.download_zip(request).await?;
     let mut response = Body::from_stream(stream).into_response();
     let headers = response.headers_mut();
 

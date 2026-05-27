@@ -67,14 +67,14 @@ fn parse_streams(response: &Value) -> Result<Vec<StreamInfo>, ExtractError> {
 
 fn parse_stream(item: &Value) -> Option<StreamInfo> {
     let url = item
-        .get("url")
+        .get("signatureCipher")
+        .or_else(|| item.get("cipher"))
         .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned)
+        .and_then(signed_cipher_url)
         .or_else(|| {
-            item.get("signatureCipher")
-                .or_else(|| item.get("cipher"))
+            item.get("url")
                 .and_then(|value| value.as_str())
-                .and_then(|cipher| query_param(cipher, "url"))
+                .map(ToOwned::to_owned)
         })?;
     let mime_type = item
         .get("mimeType")
@@ -111,6 +111,69 @@ fn parse_stream(item: &Value) -> Option<StreamInfo> {
         has_video,
         watermark: false,
     })
+}
+
+fn signed_cipher_url(cipher: &str) -> Option<String> {
+    let mut url = query_param(cipher, "url")?;
+    let signature = query_param(cipher, "s")?;
+    let signature_param = query_param(cipher, "sp").unwrap_or_else(|| "signature".to_string());
+    let signature = decipher_signature(&signature);
+    let separator = if url.contains('?') { '&' } else { '?' };
+
+    url.push(separator);
+    url.push_str("alr=yes&");
+    url.push_str(&signature_param);
+    url.push('=');
+    url.push_str(&percent_encode_component(&signature));
+
+    Some(url)
+}
+
+fn decipher_signature(signature: &str) -> String {
+    if signature.len() < 20 {
+        return signature.to_string();
+    }
+
+    let mut chars: Vec<char> = signature.chars().collect();
+
+    chars.pop();
+    swap(&mut chars, 18);
+    swap(&mut chars, 68);
+    swap(&mut chars, 20);
+    swap(&mut chars, 82);
+    chars.pop();
+    swap(&mut chars, 64);
+    chars.pop();
+
+    if !chars.is_empty() {
+        chars.remove(0);
+    }
+
+    chars.into_iter().collect()
+}
+
+fn swap(chars: &mut [char], index: usize) {
+    if chars.is_empty() {
+        return;
+    }
+
+    let target = index % chars.len();
+    chars.swap(0, target);
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+
+    encoded
 }
 
 #[cfg(test)]
@@ -179,7 +242,7 @@ mod tests {
         assert_eq!(video.streams[1].quality.as_deref(), Some("1080p"));
         assert_eq!(
             video.streams[1].url,
-            "https://video.example/itag137.mp4?itag=137"
+            "https://video.example/itag137.mp4?itag=137&alr=yes&sig=abc"
         );
     }
 }

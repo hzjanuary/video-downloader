@@ -37,12 +37,16 @@ Response:
 
 Errors:
 
-- `400` for empty or oversized ID arrays.
-- Streaming failures abort the response stream.
+- `400` for empty or oversized ID arrays. The current bulk limit is 500 IDs.
+- `502` when a live provider download URL cannot be resolved or validated.
+- Download URL validation runs before ZIP headers are sent where possible, so
+  provider failures return JSON errors instead of a half-open ZIP stream.
 
 ## Backend Streaming
 
 - The backend starts one Tokio task per selected ID.
+- For live provider IDs, the backend first extracts and probes the provider
+  media URL with a one-byte range request before opening the ZIP stream.
 - Download tasks stream chunks through bounded channels.
 - The ZIP writer emits local headers, file chunks, data descriptors, central
   directory records, and EOCD directly to the Axum response body.
