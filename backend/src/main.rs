@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bulk::{BulkDownloadError, BulkDownloadRequest, BulkDownloader};
+use bulk::{mp3_conversion_status, BulkDownloadError, BulkDownloadRequest, BulkDownloader};
 use channel::{ChannelError, ChannelFetcher};
 use extract::{ExtractError, Extractor};
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,13 @@ struct ChannelQuery {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CapabilitiesBody {
+    formats: Vec<&'static str>,
+    mp3_available: bool,
+    mp3_error: Option<String>,
 }
 
 struct ApiError {
@@ -101,7 +108,9 @@ impl From<ChannelError> for ApiError {
 impl From<BulkDownloadError> for ApiError {
     fn from(error: BulkDownloadError) -> Self {
         let status = match error {
-            BulkDownloadError::EmptyIds | BulkDownloadError::TooManyIds => StatusCode::BAD_REQUEST,
+            BulkDownloadError::EmptyIds
+            | BulkDownloadError::TooManyIds
+            | BulkDownloadError::InvalidOptions(_) => StatusCode::BAD_REQUEST,
             BulkDownloadError::PrepareFailed(_) => StatusCode::BAD_GATEWAY,
         };
 
@@ -127,6 +136,7 @@ impl IntoResponse for ApiError {
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/capabilities", get(capabilities))
         .route("/api/extract", get(extract))
         .route("/api/channel", get(channel))
         .route("/api/download/bulk", post(download_bulk))
@@ -143,6 +153,21 @@ fn cors_layer() -> CorsLayer {
 
 async fn health() -> impl IntoResponse {
     HEALTH_MESSAGE
+}
+
+async fn capabilities() -> Json<CapabilitiesBody> {
+    match mp3_conversion_status() {
+        Ok(()) => Json(CapabilitiesBody {
+            formats: vec!["mp4", "mp3"],
+            mp3_available: true,
+            mp3_error: None,
+        }),
+        Err(error) => Json(CapabilitiesBody {
+            formats: vec!["mp4"],
+            mp3_available: false,
+            mp3_error: Some(error),
+        }),
+    }
 }
 
 async fn extract(
@@ -234,6 +259,27 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body.as_ref(), HEALTH_MESSAGE.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn capabilities_route_reports_download_formats() {
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(json["formats"].as_array().unwrap().contains(&"mp4".into()));
+        assert!(json["mp3_available"].is_boolean());
     }
 
     #[tokio::test]

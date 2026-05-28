@@ -18,7 +18,7 @@ The application is structured as a decoupled full-stack application:
 |  [ Video Input Form ] |                    |  [ GET /api/extract ]  |
 |                       |  HTTP GET/POST     |  [ GET /api/channel ]  |
 |  [ Video Grid /     ] | -----------------> |                        |
-|  [ Selection State  ] |                    |  [ POST /download ]    |
+|  [ Selection State  ] |                    |  [ POST /api/download/bulk ] |
 |                       | <----------------- |  - Tokio tasks         |
 |  [ ZIP Downloader   ] |   ZIP Stream / JSON|  - zip-writer stream   |
 +-----------------------+                    +------------------------+
@@ -34,7 +34,7 @@ The backend is built around independent modules coordinated via Axum routing and
 
 - [main.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/main.rs): Configures CORS, sets up Axum router and shared `AppState`, handles logging, and wires requests to endpoints.
 - [model.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/model.rs): Holds the core domain models (`VideoInfo`, `StreamInfo`, and `ChannelVideo`) used for type safety and serialization across the boundary.
-- [bulk.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/bulk.rs): Manages concurrent download worker tasks using Tokio green threads. It retrieves raw streams and streams ZIP archive bytes back through a memory channel directly to the Axum HTTP response.
+- [bulk.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/bulk.rs): Manages concurrent download worker tasks using Tokio green threads. It retrieves raw streams, applies requested MP4 quality selection, optionally transcodes MP3 output through local GStreamer tools, and streams ZIP archive bytes back through a memory channel directly to the Axum HTTP response.
 - [extract/](file:///media/hzjnauary/Workspace/videodownloader/backend/src/extract/mod.rs): Extraction engines for single video URLs.
   - [youtube.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/extract/youtube.rs): Calls the YouTube InnerTube API (`/youtubei/v1/player`) via JSON POST using the `ANDROID` client context to obtain un-deciphered stream URLs.
   - [tiktok.rs](file:///media/hzjnauary/Workspace/videodownloader/backend/src/extract/tiktok.rs): Parses `SIGI_STATE` or `__NEXT_DATA__` from video HTML.

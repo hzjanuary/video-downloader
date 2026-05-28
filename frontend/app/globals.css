@@ -32,6 +32,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -102,6 +103,7 @@ h1 {
 
 input[type="text"],
 .input-row input,
+select,
 textarea {
   width: 100%;
   border: 1px solid var(--border);
@@ -113,6 +115,11 @@ textarea {
 
 .input-row input {
   min-height: 44px;
+}
+
+select {
+  min-height: 40px;
+  cursor: pointer;
 }
 
 textarea {
@@ -159,6 +166,23 @@ button:disabled {
   align-items: center;
   gap: 10px;
   color: var(--text);
+  font-weight: 800;
+}
+
+.download-options {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.download-options label {
+  display: grid;
+  min-width: 124px;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.75rem;
   font-weight: 800;
 }
 
@@ -241,6 +265,17 @@ input[type="checkbox"] {
     align-items: stretch;
     grid-template-columns: 1fr;
     flex-direction: column;
+  }
+
+  .download-options {
+    width: 100%;
+    margin-left: 0;
+    justify-content: stretch;
+  }
+
+  .download-options label {
+    min-width: 0;
+    width: 100%;
   }
 
   .status-pill,

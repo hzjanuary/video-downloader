@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 const apiBaseUrl =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8080";
@@ -15,6 +15,14 @@ type VideoInfo = {
   id: string | null;
   title: string | null;
   thumbnail_url: string | null;
+};
+
+type DownloadFormat = "mp4" | "mp3";
+
+type Capabilities = {
+  formats: DownloadFormat[];
+  mp3_available: boolean;
+  mp3_error: string | null;
 };
 
 type SaveFilePicker = (options: {
@@ -32,6 +40,9 @@ export default function Home() {
   const [cookie, setCookie] = useState("");
   const [videos, setVideos] = useState<ChannelVideo[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [downloadFormat, setDownloadFormat] = useState<DownloadFormat>("mp4");
+  const [downloadQuality, setDownloadQuality] = useState("best");
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [status, setStatus] = useState("Ready");
   const [isFetching, setIsFetching] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -42,6 +53,43 @@ export default function Home() {
     () => apiBaseUrl.replace(/\/$/, ""),
     [],
   );
+  const mp3Available = capabilities?.mp3_available ?? false;
+
+  useEffect(() => {
+    let ignore = false;
+
+    async function loadCapabilities() {
+      try {
+        const nextCapabilities =
+          await fetchCapabilities(normalizedApiBaseUrl);
+
+        if (ignore) {
+          return;
+        }
+
+        setCapabilities(nextCapabilities);
+
+        if (!nextCapabilities.mp3_available) {
+          setDownloadFormat("mp4");
+        }
+      } catch {
+        if (!ignore) {
+          setCapabilities({
+            formats: ["mp4"],
+            mp3_available: false,
+            mp3_error: "Could not read backend download capabilities.",
+          });
+          setDownloadFormat("mp4");
+        }
+      }
+    }
+
+    loadCapabilities();
+
+    return () => {
+      ignore = true;
+    };
+  }, [normalizedApiBaseUrl]);
 
   async function fetchVideos(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -89,6 +137,11 @@ export default function Home() {
       return;
     }
 
+    if (downloadFormat === "mp3" && !mp3Available) {
+      setStatus(capabilities?.mp3_error ?? "MP3 downloads are not available.");
+      return;
+    }
+
     setIsDownloading(true);
     setStatus(`Preparing ${ids.length} videos...`);
 
@@ -101,6 +154,8 @@ export default function Home() {
         body: JSON.stringify({
           source_url: sourceUrl.trim(),
           cookie: cookie.trim() || undefined,
+          format: downloadFormat,
+          quality: downloadQuality,
           ids,
         }),
       });
@@ -187,6 +242,40 @@ export default function Home() {
             />
             <span>Chọn tất cả</span>
           </label>
+          <div className="download-options">
+            <label htmlFor="download-format">
+              <span>Format</span>
+              <select
+                id="download-format"
+                value={downloadFormat}
+                disabled={isDownloading}
+                onChange={(event) =>
+                  setDownloadFormat(event.target.value as DownloadFormat)
+                }
+              >
+                <option value="mp4">MP4</option>
+                <option value="mp3" disabled={!mp3Available}>
+                  MP3
+                </option>
+              </select>
+            </label>
+            <label htmlFor="download-quality">
+              <span>Quality</span>
+              <select
+                id="download-quality"
+                value={downloadQuality}
+                disabled={isDownloading || downloadFormat === "mp3"}
+                onChange={(event) => setDownloadQuality(event.target.value)}
+              >
+                <option value="best">Best</option>
+                <option value="1080p">1080p</option>
+                <option value="720p">720p</option>
+                <option value="480p">480p</option>
+                <option value="360p">360p</option>
+                <option value="240p">240p</option>
+              </select>
+            </label>
+          </div>
           <button
             type="button"
             className="download-button"
@@ -236,6 +325,16 @@ async function fetchChannelVideos(apiBaseUrl: string, params: URLSearchParams) {
   }
 
   return (await response.json()) as ChannelVideo[];
+}
+
+async function fetchCapabilities(apiBaseUrl: string) {
+  const response = await fetch(`${apiBaseUrl}/api/capabilities`);
+
+  if (!response.ok) {
+    throw new Error(await readApiError(response));
+  }
+
+  return (await response.json()) as Capabilities;
 }
 
 async function fetchSingleVideo(apiBaseUrl: string, params: URLSearchParams) {

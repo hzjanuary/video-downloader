@@ -160,6 +160,8 @@ Request:
 {
   "source_url": "https://www.youtube.com/@channel/videos",
   "cookie": "optional provider cookie",
+  "format": "mp4",
+  "quality": "720p",
   "ids": ["video-id-1", "video-id-2"]
 }
 ```
@@ -172,14 +174,19 @@ Response:
 
 The backend starts download tasks concurrently and streams ZIP bytes through the
 HTTP response instead of writing temporary files or buffering the full archive.
+`format` defaults to `mp4`, and `quality` defaults to `best`. `mp3` uses the
+local GStreamer `lamemp3enc` pipeline and requires an AAC decoder plugin such as
+`avdec_aac`, `faad`, or `fdkaacdec` for common YouTube, TikTok, and Facebook
+MP4 sources.
 
 ## Frontend Workflow
 
 1. Paste a YouTube channel/playlist, TikTok profile, or Facebook URL.
 2. Click `Fetch`.
 3. Select individual videos or use `Chọn tất cả`.
-4. Click `Tải xuống x video`.
-5. Save the returned ZIP file.
+4. Choose format and quality.
+5. Click `Tải xuống x video`.
+6. Save the returned ZIP file.
 
 ## Validation
 

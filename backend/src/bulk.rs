@@ -1,8 +1,10 @@
 use std::{
     collections::HashSet,
     io,
+    io::Read,
     net::{IpAddr, Ipv6Addr},
     pin::Pin,
+    process::{Command, Stdio},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -17,6 +19,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 use crate::extract::Extractor;
+use crate::model::{StreamInfo, VideoInfo};
 
 const OUTPUT_CHANNEL_BUFFER: usize = 8;
 const DOWNLOAD_CHANNEL_BUFFER: usize = 4;
@@ -27,13 +30,23 @@ const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Appl
 pub struct BulkDownloadRequest {
     pub source_url: Option<String>,
     pub cookie: Option<String>,
+    pub format: Option<DownloadFormat>,
+    pub quality: Option<String>,
     pub ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadFormat {
+    Mp4,
+    Mp3,
 }
 
 #[derive(Debug)]
 pub enum BulkDownloadError {
     EmptyIds,
     TooManyIds,
+    InvalidOptions(String),
     PrepareFailed(String),
 }
 
@@ -42,9 +55,22 @@ impl BulkDownloadError {
         match self {
             Self::EmptyIds => "ids must contain at least one video id".to_string(),
             Self::TooManyIds => "ids must contain at most 500 video ids".to_string(),
+            Self::InvalidOptions(error) => error.clone(),
             Self::PrepareFailed(error) => error.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DownloadOptions {
+    format: DownloadFormat,
+    quality: DownloadQuality,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DownloadQuality {
+    Best,
+    MaxHeight(u32),
 }
 
 #[derive(Clone)]
@@ -112,6 +138,7 @@ impl BulkDownloader {
         &self,
         request: BulkDownloadRequest,
     ) -> Result<ReceiverStream, BulkDownloadError> {
+        let options = DownloadOptions::from_request(&request)?;
         let ids = unique_ids(request.ids);
 
         if ids.is_empty() {
@@ -123,7 +150,7 @@ impl BulkDownloader {
         }
 
         let entries = self
-            .start_downloads(ids, request.source_url, request.cookie)
+            .start_downloads(ids, request.source_url, request.cookie, options)
             .await?;
         let (sender, receiver) = mpsc::channel(OUTPUT_CHANNEL_BUFFER);
 
@@ -141,12 +168,16 @@ impl BulkDownloader {
         ids: Vec<String>,
         source_url: Option<String>,
         cookie: Option<String>,
+        options: DownloadOptions,
     ) -> Result<Vec<DownloadEntry>, BulkDownloadError> {
+        if options.format == DownloadFormat::Mp3 {
+            mp3_conversion_status().map_err(BulkDownloadError::PrepareFailed)?;
+        }
+
         let mut entries = Vec::with_capacity(ids.len());
 
         for id in ids {
             let (sender, receiver) = mpsc::channel(DOWNLOAD_CHANNEL_BUFFER);
-            let filename = format!("{}.bin", safe_filename(&id));
 
             match &self.source {
                 DownloadSource::Live => {
@@ -155,11 +186,12 @@ impl BulkDownloader {
                     let source_url = source_url.clone();
                     let cookie = cookie.clone();
                     let download_id = id.clone();
-                    let download_url = resolve_download_url(
+                    let resolved = resolve_download(
                         extractor.clone(),
                         source_url.as_deref(),
                         cookie.as_deref(),
                         &download_id,
+                        options,
                     )
                     .await
                     .map_err(|error| {
@@ -167,17 +199,29 @@ impl BulkDownloader {
                             "failed to prepare {download_id}: {error}"
                         ))
                     })?;
-                    let response = open_download_response(
-                        &client,
-                        cookie.as_deref(),
-                        &download_url,
-                        &download_id,
-                    )
-                    .await
-                    .map_err(BulkDownloadError::PrepareFailed)?;
+                    if resolved.transcode_mp3 {
+                        tokio::spawn(async move {
+                            transcode_mp3_url(resolved.url, sender).await;
+                        });
+                    } else {
+                        let response = open_download_response(
+                            &client,
+                            cookie.as_deref(),
+                            &resolved.url,
+                            &download_id,
+                        )
+                        .await
+                        .map_err(BulkDownloadError::PrepareFailed)?;
 
-                    tokio::spawn(async move {
-                        stream_live_response(response, sender).await;
+                        tokio::spawn(async move {
+                            stream_live_response(response, sender).await;
+                        });
+                    }
+
+                    entries.push(DownloadEntry {
+                        id,
+                        filename: format!("{}.{}", safe_filename(&download_id), resolved.extension),
+                        receiver,
                     });
                 }
                 #[cfg(test)]
@@ -205,14 +249,14 @@ impl BulkDownloader {
                             }
                         }
                     });
+
+                    entries.push(DownloadEntry {
+                        filename: format!("{}.bin", safe_filename(&id)),
+                        id,
+                        receiver,
+                    });
                 }
             }
-
-            entries.push(DownloadEntry {
-                id,
-                filename,
-                receiver,
-            });
         }
 
         Ok(entries)
@@ -240,14 +284,99 @@ async fn stream_live_response(response: Response, sender: mpsc::Sender<Result<By
     }
 }
 
-async fn resolve_download_url(
+async fn transcode_mp3_url(download_url: String, sender: mpsc::Sender<Result<Bytes, String>>) {
+    let output_sender = sender.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut child = Command::new("gst-launch-1.0")
+            .arg("-q")
+            .arg("souphttpsrc")
+            .arg(format!("location={download_url}"))
+            .arg(format!("user-agent={BROWSER_USER_AGENT}"))
+            .arg("!")
+            .arg("decodebin")
+            .arg("!")
+            .arg("audioconvert")
+            .arg("!")
+            .arg("audioresample")
+            .arg("!")
+            .arg("lamemp3enc")
+            .arg("target=bitrate")
+            .arg("bitrate=192")
+            .arg("cbr=true")
+            .arg("!")
+            .arg("id3v2mux")
+            .arg("!")
+            .arg("fdsink")
+            .arg("fd=1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to start MP3 encoder: {error}"))?;
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to open MP3 encoder stdout".to_string())?;
+        let mut buffer = [0u8; 16 * 1024];
+
+        loop {
+            let count = stdout
+                .read(&mut buffer)
+                .map_err(|error| format!("failed to read MP3 encoder output: {error}"))?;
+
+            if count == 0 {
+                break;
+            }
+
+            if output_sender
+                .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..count])))
+                .is_err()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("failed to finish MP3 encoder: {error}"))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("MP3 encoder failed: {}", stderr.trim()))
+        }
+    })
+    .await
+    .map_err(|error| format!("MP3 encoder task failed: {error}"))
+    .and_then(|result| result);
+
+    if let Err(error) = result {
+        let _ = sender.send(Err(error)).await;
+    }
+}
+
+struct ResolvedDownload {
+    url: String,
+    extension: &'static str,
+    transcode_mp3: bool,
+}
+
+async fn resolve_download(
     extractor: Arc<Extractor>,
     source_url: Option<&str>,
     cookie: Option<&str>,
     id: &str,
-) -> Result<String, String> {
+    options: DownloadOptions,
+) -> Result<ResolvedDownload, String> {
     if id.starts_with("http://") || id.starts_with("https://") {
-        return Ok(id.to_string());
+        return Ok(ResolvedDownload {
+            url: id.to_string(),
+            extension: options.extension(),
+            transcode_mp3: options.format == DownloadFormat::Mp3,
+        });
     }
 
     let source_url =
@@ -268,18 +397,13 @@ async fn resolve_download_url(
         .extract_with_cookie(&video_url, cookie)
         .await
         .map_err(|error| error.message())?;
-    let stream = info
-        .streams
-        .iter()
-        .find(|stream| stream.has_video && stream.has_audio && !stream.watermark)
-        .or_else(|| {
-            info.streams
-                .iter()
-                .find(|stream| stream.has_video && !stream.watermark)
-        })
-        .ok_or_else(|| "no downloadable stream found".to_string())?;
+    let stream = select_stream(&info, options)?;
 
-    Ok(stream.url.clone())
+    Ok(ResolvedDownload {
+        url: stream.url.clone(),
+        extension: options.extension(),
+        transcode_mp3: options.format == DownloadFormat::Mp3,
+    })
 }
 
 async fn open_download_response(
@@ -594,6 +718,179 @@ fn clean_cookie(cookie: Option<&str>) -> Option<&str> {
     cookie.map(str::trim).filter(|value| !value.is_empty())
 }
 
+impl DownloadOptions {
+    fn from_request(request: &BulkDownloadRequest) -> Result<Self, BulkDownloadError> {
+        Ok(Self {
+            format: request.format.unwrap_or(DownloadFormat::Mp4),
+            quality: DownloadQuality::from_request(request.quality.as_deref())
+                .map_err(BulkDownloadError::InvalidOptions)?,
+        })
+    }
+
+    fn extension(self) -> &'static str {
+        match self.format {
+            DownloadFormat::Mp4 => "mp4",
+            DownloadFormat::Mp3 => "mp3",
+        }
+    }
+}
+
+impl DownloadQuality {
+    fn from_request(raw: Option<&str>) -> Result<Self, String> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Best);
+        };
+
+        if raw.eq_ignore_ascii_case("best") {
+            return Ok(Self::Best);
+        }
+
+        let height = raw
+            .strip_suffix('p')
+            .or_else(|| raw.strip_suffix('P'))
+            .unwrap_or(raw)
+            .parse::<u32>()
+            .map_err(|_| "quality must be best or a height such as 720p".to_string())?;
+
+        if height == 0 {
+            return Err("quality height must be greater than zero".to_string());
+        }
+
+        Ok(Self::MaxHeight(height))
+    }
+}
+
+fn select_stream(info: &VideoInfo, options: DownloadOptions) -> Result<&StreamInfo, String> {
+    match options.format {
+        DownloadFormat::Mp4 => select_mp4_stream(&info.streams, options.quality)
+            .ok_or_else(|| "no MP4 video stream found".to_string()),
+        DownloadFormat::Mp3 => select_mp3_source_stream(&info.streams)
+            .ok_or_else(|| "no playable audio/video stream found for MP3 conversion".to_string()),
+    }
+}
+
+fn select_mp4_stream(streams: &[StreamInfo], quality: DownloadQuality) -> Option<&StreamInfo> {
+    let candidates: Vec<&StreamInfo> = streams
+        .iter()
+        .filter(|stream| {
+            !stream.watermark
+                && stream.has_video
+                && stream
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("video/mp4"))
+        })
+        .collect();
+    let with_audio: Vec<&StreamInfo> = candidates
+        .iter()
+        .copied()
+        .filter(|stream| stream.has_audio)
+        .collect();
+
+    select_by_quality(&with_audio, quality).or_else(|| select_by_quality(&candidates, quality))
+}
+
+fn select_mp3_source_stream(streams: &[StreamInfo]) -> Option<&StreamInfo> {
+    streams
+        .iter()
+        .filter(|stream| {
+            !stream.watermark
+                && stream.has_audio
+                && stream.has_video
+                && stream
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|mime| mime.starts_with("video/mp4"))
+        })
+        .max_by_key(|stream| {
+            (
+                stream_height(stream).unwrap_or(0),
+                stream.bitrate.unwrap_or(0),
+            )
+        })
+        .or_else(|| {
+            streams
+                .iter()
+                .filter(|stream| !stream.watermark && stream.has_audio && !stream.has_video)
+                .max_by_key(|stream| stream.bitrate.unwrap_or(0))
+        })
+}
+
+pub fn mp3_conversion_status() -> Result<(), String> {
+    ensure_command_success("gst-launch-1.0", &["--version"])?;
+    ensure_command_success("gst-inspect-1.0", &["lamemp3enc"])?;
+
+    if ["avdec_aac", "faad", "fdkaacdec"]
+        .iter()
+        .any(|plugin| ensure_command_success("gst-inspect-1.0", &[*plugin]).is_ok())
+    {
+        Ok(())
+    } else {
+        Err("MP3 conversion requires a GStreamer AAC decoder plugin such as avdec_aac, faad, or fdkaacdec".to_string())
+    }
+}
+
+fn ensure_command_success(command: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(command)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("failed to run {command}: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{command} {} failed", args.join(" ")))
+    }
+}
+
+fn select_by_quality<'a>(
+    streams: &[&'a StreamInfo],
+    quality: DownloadQuality,
+) -> Option<&'a StreamInfo> {
+    match quality {
+        DownloadQuality::Best => streams.iter().copied().max_by_key(|stream| {
+            (
+                stream_height(stream).unwrap_or(0),
+                stream.bitrate.unwrap_or(0),
+            )
+        }),
+        DownloadQuality::MaxHeight(target) => streams
+            .iter()
+            .copied()
+            .filter(|stream| stream_height(stream).is_some_and(|height| height <= target))
+            .max_by_key(|stream| {
+                (
+                    stream_height(stream).unwrap_or(0),
+                    stream.bitrate.unwrap_or(0),
+                )
+            })
+            .or_else(|| {
+                streams.iter().copied().min_by_key(|stream| {
+                    (
+                        stream_height(stream).unwrap_or(u32::MAX),
+                        stream.bitrate.unwrap_or(u64::MAX),
+                    )
+                })
+            }),
+    }
+}
+
+fn stream_height(stream: &StreamInfo) -> Option<u32> {
+    stream.height.or_else(|| {
+        stream.quality.as_deref().and_then(|quality| {
+            let digits: String = quality
+                .chars()
+                .skip_while(|character| !character.is_ascii_digit())
+                .take_while(|character| character.is_ascii_digit())
+                .collect();
+
+            digits.parse().ok()
+        })
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -608,6 +905,8 @@ pub(crate) mod tests {
             .download_zip(BulkDownloadRequest {
                 source_url: None,
                 cookie: None,
+                format: None,
+                quality: None,
                 ids: vec!["alpha".to_string(), "beta".to_string()],
             })
             .await
@@ -630,6 +929,79 @@ pub(crate) mod tests {
             ]),
             vec!["alpha".to_string(), "beta".to_string()]
         );
+    }
+
+    #[test]
+    fn selects_requested_mp4_quality_with_audio() {
+        let streams = vec![
+            stream(
+                "https://video.example/360.mp4",
+                "video/mp4",
+                Some(360),
+                true,
+                true,
+            ),
+            stream(
+                "https://video.example/720-video.mp4",
+                "video/mp4",
+                Some(720),
+                false,
+                true,
+            ),
+            stream(
+                "https://video.example/480.mp4",
+                "video/mp4",
+                Some(480),
+                true,
+                true,
+            ),
+        ];
+        let selected = select_mp4_stream(&streams, DownloadQuality::MaxHeight(720)).unwrap();
+
+        assert_eq!(selected.url, "https://video.example/480.mp4");
+    }
+
+    #[test]
+    fn selects_combined_video_source_for_mp3_conversion() {
+        let streams = vec![
+            stream(
+                "https://audio.example/audio.m4a",
+                "audio/mp4",
+                None,
+                true,
+                false,
+            ),
+            stream(
+                "https://video.example/video.mp4",
+                "video/mp4",
+                Some(720),
+                true,
+                true,
+            ),
+        ];
+        let selected = select_mp3_source_stream(&streams).unwrap();
+
+        assert_eq!(selected.url, "https://video.example/video.mp4");
+    }
+
+    fn stream(
+        url: &str,
+        mime_type: &str,
+        height: Option<u32>,
+        has_audio: bool,
+        has_video: bool,
+    ) -> StreamInfo {
+        StreamInfo {
+            url: url.to_string(),
+            mime_type: Some(mime_type.to_string()),
+            quality: height.map(|height| format!("{height}p")),
+            width: None,
+            height,
+            bitrate: None,
+            has_audio,
+            has_video,
+            watermark: false,
+        }
     }
 
     pub(crate) async fn collect_stream(mut stream: ReceiverStream) -> Vec<u8> {
